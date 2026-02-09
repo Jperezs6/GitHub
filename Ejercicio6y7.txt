@@ -1,0 +1,800 @@
+REPORT zfi_report_jdps.
+
+TYPES:
+  BEGIN OF ty_articulos,
+    bukrs        TYPE bukrs,
+    partner_type TYPE c LENGTH 1,
+    partner_id   TYPE char10,
+    partner_name TYPE name1,
+    belnr        TYPE belnr_d,
+    gjahr        TYPE gjahr,
+    bldat        TYPE bldat,
+    budat        TYPE budat,
+    waers        TYPE waers,
+    amount_orig  TYPE wrbtr,
+    amount_rep   TYPE wrbtr,
+    rep_waers    TYPE waers,
+    conv_error   TYPE abap_bool,
+  END OF ty_articulos.
+
+TYPES:
+  BEGIN OF ty_salida,
+    bukrs        TYPE bukrs,
+    partner_type TYPE c LENGTH 1,
+    partner_id   TYPE char10,
+    partner_name TYPE name1,
+    belnr        TYPE belnr_d,
+    gjahr        TYPE gjahr,
+    bldat        TYPE bldat,
+    budat        TYPE budat,
+    waers        TYPE waers,
+    amount_orig  TYPE wrbtr,
+    amount_rep   TYPE wrbtr,
+    rep_waers    TYPE waers,
+    days_open    TYPE i,
+    bucket       TYPE char10,
+    status_text  TYPE char20,
+    status_icon  TYPE icon_d,
+    conv_error   TYPE abap_bool,
+  END OF ty_salida.
+
+"! Tabla de salida para ALV
+TYPES:
+  tt_out TYPE STANDARD TABLE OF ty_salida WITH EMPTY KEY.
+TYPES:
+  tt_articulos TYPE STANDARD TABLE OF ty_articulos WITH EMPTY KEY.
+
+TYPES: ty_r_kunnr TYPE RANGE OF kunnr,
+       ty_r_lifnr TYPE RANGE OF lifnr,
+       ty_r_budat TYPE RANGE OF budat.
+
+"! <p class="shorttext synchronized">Conversor de moneda para importes financieros</p>
+"! Maneja conversión de moneda usando tipos de cambio estándar de SAP.
+"! Implementa SRP aislando la lógica de conversión.
+CLASS lcl_currency_converter DEFINITION.
+  PUBLIC SECTION.
+    "! <p class="shorttext synchronized">Estructura de parámetros de conversión</p>
+    TYPES: BEGIN OF ty_convert_params,
+             "! Importe a convertir (origen)
+             amount_from   TYPE wrbtr,
+             "! Moneda origen
+             currency_from TYPE waers,
+             "! Moneda destino
+             currency_to   TYPE waers,
+             "! Fecha de conversión (para determinar tipo de cambio)
+             conv_date     TYPE budat,
+             "! Tipo de cambio (default: M)
+             exch_type     TYPE kurst,
+             "! Sociedad (opcional)
+             company_code  TYPE bukrs,
+           END OF ty_convert_params.
+
+    "! <p class="shorttext synchronized">Estructura de resultado de conversión</p>
+    TYPES: BEGIN OF ty_conversion_result,
+             "! Importe convertido (destino)
+             amount_to   TYPE wrbtr,
+             "! Moneda destino (confirmación)
+             currency_to TYPE waers,
+             "! Estado: S=Éxito, W=Advertencia, E=Error
+             status      TYPE c LENGTH 1,
+             "! Mensaje (detalle error/advertencia)
+             message     TYPE string,
+             "! Tipo de cambio utilizado (opcional)
+             rate_used   TYPE ukurs,
+           END OF ty_conversion_result.
+
+    "! Tipo de cambio default (promedio)
+    CONSTANTS: gc_kurst_default TYPE kurst VALUE 'M'.
+
+    "! <p class="shorttext synchronized">Convierte un importe de moneda origen a moneda destino</p>
+    "! Usa conversión estándar SAP con manejo de errores.
+    "! @parameter is_params | Parámetros de conversión
+    "! @return rs_result | Resultado con estado y mensaje
+    METHODS: convert_amount
+      IMPORTING
+        is_params        TYPE ty_convert_params
+      RETURNING
+        VALUE(rs_result) TYPE ty_conversion_result.
+
+  PRIVATE SECTION.
+    "! <p class="shorttext synchronized">Valida parámetros de entrada</p>
+    "! @parameter is_params | Parámetros a validar
+    "! @return rv_message | Mensaje de error si inválido, vacío si válido
+    METHODS: validate_params
+      IMPORTING
+        is_params         TYPE ty_convert_params
+      RETURNING
+        VALUE(rv_message) TYPE string.
+
+    "! <p class="shorttext synchronized">Ejecuta la conversión estándar SAP</p>
+    "! @parameter is_params | Parámetros de conversión
+    "! @return rs_result | Resultado de conversión
+    METHODS: execute_conversion
+      IMPORTING
+        is_params        TYPE ty_convert_params
+      RETURNING
+        VALUE(rs_result) TYPE ty_conversion_result.
+
+    "! <p class="shorttext synchronized">Obtiene mensaje de error del FM</p>
+    "! @return rv_message | Mensaje formateado
+    METHODS: get_fm_error_message
+      RETURNING
+        VALUE(rv_message) TYPE string.
+ENDCLASS.
+
+
+
+CLASS lcl_currency_converter IMPLEMENTATION.
+
+  METHOD convert_amount.
+    CLEAR rs_result.
+    rs_result-currency_to = is_params-currency_to.
+    rs_result-status      = 'E'.
+
+    DATA(lv_error_msg) = validate_params( is_params ).
+    IF lv_error_msg IS NOT INITIAL.
+      rs_result-message = lv_error_msg.
+      RETURN.
+    ENDIF.
+
+    IF is_params-currency_from = is_params-currency_to.
+      rs_result-amount_to = is_params-amount_from.
+      rs_result-status    = 'S'.
+      rs_result-message   = |No requiere conversión ({ is_params-currency_from })|.
+      rs_result-rate_used = 1.
+      RETURN.
+    ENDIF.
+
+    rs_result = execute_conversion( is_params ).
+  ENDMETHOD.
+
+  METHOD validate_params.
+    CLEAR rv_message.
+
+    IF is_params-amount_from IS INITIAL.
+      rv_message = 'El importe es obligatorio'.
+      RETURN.
+    ENDIF.
+
+    IF is_params-currency_from IS INITIAL.
+      rv_message = 'La moneda origen es obligatoria'.
+      RETURN.
+    ENDIF.
+
+    IF is_params-currency_to IS INITIAL.
+      rv_message = 'La moneda destino es obligatoria'.
+      RETURN.
+    ENDIF.
+
+    IF is_params-conv_date IS INITIAL.
+      rv_message = 'La fecha de conversión es obligatoria'.
+      RETURN.
+    ENDIF.
+
+    IF is_params-conv_date > sy-datum.
+      rv_message = |La fecha de conversión ({ is_params-conv_date DATE = USER }) no puede ser futura|.
+      RETURN.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD execute_conversion.
+    CLEAR rs_result.
+    rs_result-currency_to = is_params-currency_to.
+
+    DATA(lv_kurst) = COND kurst(
+      WHEN is_params-exch_type IS NOT INITIAL
+      THEN is_params-exch_type
+      ELSE gc_kurst_default
+    ).
+
+    TRY.
+        CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+          EXPORTING
+            date             = is_params-conv_date
+            foreign_amount   = is_params-amount_from
+            foreign_currency = is_params-currency_from
+            local_currency   = is_params-currency_to
+            type_of_rate     = lv_kurst
+          IMPORTING
+            local_amount     = rs_result-amount_to
+            exchange_rate    = rs_result-rate_used
+          EXCEPTIONS
+            no_rate_found    = 1
+            overflow         = 2
+            no_factors_found = 3
+            no_spread_found  = 4
+            derived_2_times  = 5
+            OTHERS           = 6.
+
+        CASE sy-subrc.
+          WHEN 0.
+            DATA(lv_rate_txt) = CONV string( rs_result-rate_used ).
+            CONDENSE lv_rate_txt NO-GAPS.
+
+            rs_result-status  = 'S'.
+            rs_result-message = |Convertido de { is_params-currency_from } a { is_params-currency_to } (t/c: { lv_rate_txt })|.
+
+            IF is_params-exch_type IS INITIAL.
+              rs_result-status  = 'W'.
+              rs_result-message = |{ rs_result-message } - Se usó tipo de cambio default '{ gc_kurst_default }'|.
+            ENDIF.
+
+          WHEN 1.
+            rs_result-status  = 'E'.
+            rs_result-message = |No existe tipo de cambio para { is_params-currency_from }->{ is_params-currency_to } en { is_params-conv_date DATE = USER } (tipo { lv_kurst })|.
+
+          WHEN 2.
+            rs_result-status  = 'E'.
+            rs_result-message = |Overflow en conversión: importe { is_params-amount_from } demasiado grande|.
+
+          WHEN 3.
+            rs_result-status  = 'E'.
+            rs_result-message = |No existen factores de conversión para { is_params-currency_from }/{ is_params-currency_to }|.
+
+          WHEN 4.
+            rs_result-status  = 'E'.
+            rs_result-message = |No existe spread para tipo de cambio { lv_kurst }|.
+
+          WHEN 5.
+            rs_result-status  = 'E'.
+            rs_result-message = |Ruta de moneda inválida: no se puede derivar 2 veces|.
+
+          WHEN OTHERS.
+            rs_result-status  = 'E'.
+            rs_result-message = get_fm_error_message( ).
+            IF rs_result-message IS INITIAL.
+              rs_result-message = |Error desconocido en conversión (SUBRC: { sy-subrc })|.
+            ENDIF.
+        ENDCASE.
+
+      CATCH cx_root INTO DATA(lx_conv).
+        rs_result-status  = 'E'.
+        rs_result-message = |Excepción en conversión: { lx_conv->get_text( ) }|.
+    ENDTRY.
+
+    IF rs_result-status = 'E'.
+      CLEAR rs_result-amount_to.
+      CLEAR rs_result-rate_used.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD get_fm_error_message.
+    IF sy-msgid IS NOT INITIAL.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+        WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4
+        INTO rv_message.
+    ELSE.
+      CLEAR rv_message.
+    ENDIF.
+  ENDMETHOD.
+
+ENDCLASS.
+
+CLASS lcl_aging_report DEFINITION.
+  PUBLIC SECTION.
+    "! <p class="shorttext synchronized">Lógica de Aging para partidas abiertas AR/AP: lectura, enriquecimiento, conversión y clasificación.</p>
+    CONSTANTS: gc_bkt_30 TYPE i VALUE 30,
+               gc_bkt_60 TYPE i VALUE 60,
+               gc_bkt_90 TYPE i VALUE 90,
+               gc_kurst  TYPE kurst VALUE 'M'.
+
+    TYPES: BEGIN OF ty_clasif,
+             bucket      TYPE char10,
+             status_text TYPE char20,
+             status_icon TYPE icon_d,
+           END OF ty_clasif.
+
+    "! <p class="shorttext synchronized">Constructor: guarda filtros y valida entrada.</p>
+    "! @parameter iv_bukrs | Sociedad (obligatorio)
+    "! @parameter it_kunnr | Rango de clientes (opcional)
+    "! @parameter it_lifnr | Rango de proveedores (opcional)
+    "! @parameter it_budat | Rango fecha contabilización (opcional)
+    "! @parameter iv_rep_waers | Moneda de reporte (default USD)
+    METHODS:
+      constructor
+        IMPORTING
+          iv_bukrs     TYPE bukrs
+          it_kunnr     TYPE ty_r_kunnr OPTIONAL
+          it_lifnr     TYPE ty_r_lifnr OPTIONAL
+          it_budat     TYPE ty_r_budat OPTIONAL
+          iv_rep_waers TYPE waers DEFAULT 'USD'.
+
+    "! <p class="shorttext synchronized">Orquestación principal: lee, enriquece, convierte, clasifica y devuelve salida.</p>
+    "! @return rt_out | Tabla salida para ALV
+    METHODS: get_data
+      RETURNING VALUE(rt_out) TYPE tt_out.
+
+  PRIVATE SECTION.
+    DATA: mv_bukrs     TYPE bukrs,
+          mt_kunnr     TYPE ty_r_kunnr,
+          mt_lifnr     TYPE ty_r_lifnr,
+          mt_budat     TYPE ty_r_budat,
+          mv_rep_waers TYPE waers.
+
+    METHODS: validar_entrada.
+
+    METHODS: leer_partidas_abiertas
+      RETURNING VALUE(rt_src) TYPE tt_articulos.
+
+    METHODS: enriquecer_nombres_socios
+      CHANGING ct_src TYPE tt_articulos.
+
+    METHODS: convertir_importes
+      CHANGING ct_src TYPE tt_articulos.
+
+    METHODS: convertir_moneda_m
+      IMPORTING
+                iv_importe        TYPE dmbtr
+                iv_waers          TYPE waers
+                iv_fecha          TYPE budat
+      RETURNING VALUE(rv_importe) TYPE dmbtr.
+
+    METHODS: mapear_salida
+      IMPORTING it_src        TYPE tt_articulos
+      RETURNING VALUE(rt_out) TYPE tt_out.
+
+    METHODS: clasificar_antiguedad
+      IMPORTING iv_dias          TYPE i
+      RETURNING VALUE(rs_clasif) TYPE ty_clasif.
+ENDCLASS.
+
+CLASS lcl_aging_report IMPLEMENTATION.
+
+  METHOD constructor.
+    mv_bukrs     = iv_bukrs.
+    mt_kunnr     = it_kunnr.
+    mt_lifnr     = it_lifnr.
+    mt_budat     = it_budat.
+    mv_rep_waers = iv_rep_waers.
+    validar_entrada( ).
+  ENDMETHOD.
+
+  METHOD validar_entrada.
+    IF mv_bukrs IS INITIAL.
+      MESSAGE 'Sociedad (BUKRS) es obligatoria.' TYPE 'E'.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD get_data.
+    DATA(lt_src) = leer_partidas_abiertas( ).
+    enriquecer_nombres_socios( CHANGING ct_src = lt_src ).
+    convertir_importes( CHANGING ct_src = lt_src ).
+    rt_out = mapear_salida( lt_src ).
+  ENDMETHOD.
+
+  METHOD leer_partidas_abiertas.
+    CLEAR rt_src.
+
+    " AR: Partidas abiertas clientes
+    SELECT s~bukrs,
+           'K' AS partner_type,
+           s~kunnr AS partner_id,
+           @space AS partner_name,
+           s~belnr,
+           s~gjahr,
+           k~bldat,
+           k~budat,
+           s~waers,
+           s~wrbtr AS amount_orig
+      FROM bsid_view AS s
+      INNER JOIN bkpf AS k
+        ON  s~bukrs = k~bukrs
+        AND s~belnr = k~belnr
+        AND s~gjahr = k~gjahr
+      WHERE s~bukrs = @mv_bukrs
+        AND s~augbl = @space
+        AND ( s~kunnr IN @mt_kunnr )
+        AND ( k~budat IN @mt_budat )
+      APPENDING CORRESPONDING FIELDS OF TABLE @rt_src.
+
+    " AP: Partidas abiertas proveedores
+    SELECT s~bukrs,
+           'L' AS partner_type,
+           s~lifnr AS partner_id,
+           @space AS partner_name,
+           s~belnr,
+           s~gjahr,
+           k~bldat,
+           k~budat,
+           s~waers,
+           s~wrbtr AS amount_orig
+      FROM bsik_view AS s
+      INNER JOIN bkpf AS k
+        ON  s~bukrs = k~bukrs
+        AND s~belnr = k~belnr
+        AND s~gjahr = k~gjahr
+      WHERE s~bukrs = @mv_bukrs
+        AND s~augbl = @space
+        AND ( s~lifnr IN @mt_lifnr )
+        AND ( k~budat IN @mt_budat )
+      APPENDING CORRESPONDING FIELDS OF TABLE @rt_src.
+  ENDMETHOD.
+
+  METHOD enriquecer_nombres_socios.
+    DATA: lt_kunnr TYPE STANDARD TABLE OF kunnr,
+          lt_lifnr TYPE STANDARD TABLE OF lifnr,
+          lt_kna1  TYPE HASHED TABLE OF kna1 WITH UNIQUE KEY kunnr,
+          lt_lfa1  TYPE HASHED TABLE OF lfa1 WITH UNIQUE KEY lifnr.
+
+    LOOP AT ct_src ASSIGNING FIELD-SYMBOL(<ls_src>).
+      IF <ls_src>-partner_type = 'K' AND <ls_src>-partner_id IS NOT INITIAL.
+        DATA(lv_kunnr) = CONV kunnr( <ls_src>-partner_id ).
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = <ls_src>-partner_id
+          IMPORTING
+            output = lv_kunnr.
+        APPEND lv_kunnr TO lt_kunnr.
+      ELSEIF <ls_src>-partner_type = 'L' AND <ls_src>-partner_id IS NOT INITIAL.
+        DATA(lv_lifnr) = CONV lifnr( <ls_src>-partner_id ).
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = <ls_src>-partner_id
+          IMPORTING
+            output = lv_lifnr.
+        APPEND lv_lifnr TO lt_lifnr.
+      ENDIF.
+    ENDLOOP.
+
+    IF lt_kunnr IS NOT INITIAL.
+      SELECT kunnr, name1
+        FROM kna1
+        FOR ALL ENTRIES IN @lt_kunnr
+        WHERE kunnr = @lt_kunnr-table_line
+        INTO TABLE @lt_kna1.
+    ENDIF.
+
+    IF lt_lifnr IS NOT INITIAL.
+      SELECT lifnr, name1
+        FROM lfa1
+        FOR ALL ENTRIES IN @lt_lifnr
+        WHERE lifnr = @lt_lifnr-table_line
+        INTO TABLE @lt_lfa1.
+    ENDIF.
+
+    LOOP AT ct_src ASSIGNING <ls_src>.
+      IF <ls_src>-partner_type = 'K'.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = <ls_src>-partner_id
+          IMPORTING
+            output = lv_kunnr.
+        TRY.
+            <ls_src>-partner_name = lt_kna1[ kunnr = lv_kunnr ]-name1.
+          CATCH cx_sy_itab_line_not_found.
+            <ls_src>-partner_name = '[Cliente no encontrado]'.
+        ENDTRY.
+      ELSEIF <ls_src>-partner_type = 'L'.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = <ls_src>-partner_id
+          IMPORTING
+            output = lv_lifnr.
+        TRY.
+            <ls_src>-partner_name = lt_lfa1[ lifnr = lv_lifnr ]-name1.
+          CATCH cx_sy_itab_line_not_found.
+            <ls_src>-partner_name = '[Proveedor no encontrado]'.
+        ENDTRY.
+      ENDIF.
+    ENDLOOP.
+  ENDMETHOD.
+
+  METHOD convertir_importes.
+    DATA(lo_conv) = NEW lcl_currency_converter( ).
+
+    LOOP AT ct_src ASSIGNING FIELD-SYMBOL(<ls_src>).
+      DATA(ls_params) = VALUE lcl_currency_converter=>ty_convert_params(
+        amount_from   = <ls_src>-amount_orig
+        currency_from = <ls_src>-waers
+        currency_to   = mv_rep_waers
+        conv_date     = <ls_src>-budat
+        exch_type     = lcl_aging_report=>gc_kurst
+        company_code  = mv_bukrs
+      ).
+
+      DATA(ls_res) = lo_conv->convert_amount( ls_params ).
+
+      <ls_src>-amount_rep = ls_res-amount_to.
+      <ls_src>-rep_waers  = ls_res-currency_to.
+      <ls_src>-conv_error = COND #( WHEN ls_res-status = 'E' THEN abap_true ELSE abap_false ).
+    ENDLOOP.
+  ENDMETHOD.
+
+  METHOD convertir_moneda_m.
+    CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+      EXPORTING
+        date             = iv_fecha
+        foreign_amount   = iv_importe
+        foreign_currency = iv_waers
+        local_currency   = mv_rep_waers
+        type_of_rate     = gc_kurst
+      IMPORTING
+        local_amount     = rv_importe
+      EXCEPTIONS
+        no_rate_found    = 1
+        overflow         = 2
+        no_factors_found = 3
+        no_spread_found  = 4
+        derived_2_times  = 5
+        OTHERS           = 6.
+
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE 'E' NUMBER sy-msgno
+        WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD mapear_salida.
+    rt_out = VALUE tt_out(
+      FOR ls_src IN it_src
+      LET lv_dias = COND i(
+                      WHEN ls_src-budat IS NOT INITIAL
+                      THEN CONV i( sy-datum - ls_src-budat )
+                      ELSE -1 )
+          ls_cls = clasificar_antiguedad( iv_dias = lv_dias )
+      IN (
+        bukrs        = ls_src-bukrs
+        partner_type = ls_src-partner_type
+        partner_id   = ls_src-partner_id
+        partner_name = ls_src-partner_name
+        belnr        = ls_src-belnr
+        gjahr        = ls_src-gjahr
+        bldat        = ls_src-bldat
+        budat        = ls_src-budat
+        waers        = ls_src-waers
+        amount_orig  = ls_src-amount_orig
+        amount_rep   = ls_src-amount_rep
+        rep_waers    = ls_src-rep_waers
+        days_open    = lv_dias
+        bucket       = ls_cls-bucket
+        status_text  = ls_cls-status_text
+        status_icon  = ls_cls-status_icon
+        conv_error   = ls_src-conv_error
+      )
+    ).
+  ENDMETHOD.
+
+  METHOD clasificar_antiguedad.
+    CLEAR rs_clasif.
+
+    IF iv_dias < 0.
+      rs_clasif-bucket      = 'Inválido'.
+      rs_clasif-status_text = 'Fecha inválida'.
+      rs_clasif-status_icon = icon_led_inactive.
+      RETURN.
+    ENDIF.
+
+    IF iv_dias <= gc_bkt_30.
+      rs_clasif-bucket      = '0-30'.
+      rs_clasif-status_text = 'Al día'.
+      rs_clasif-status_icon = icon_green_light.
+    ELSEIF iv_dias <= gc_bkt_60.
+      rs_clasif-bucket      = '31-60'.
+      rs_clasif-status_text = 'Advertencia'.
+      rs_clasif-status_icon = icon_yellow_light.
+    ELSEIF iv_dias <= gc_bkt_90.
+      rs_clasif-bucket      = '61-90'.
+      rs_clasif-status_text = 'Riesgo alto'.
+      rs_clasif-status_icon = icon_yellow_light.
+    ELSE.
+      rs_clasif-bucket      = '>90'.
+      rs_clasif-status_text = 'Crítico'.
+      rs_clasif-status_icon = icon_red_light.
+    ENDIF.
+  ENDMETHOD.
+
+ENDCLASS.
+CLASS ltc_currency_converter DEFINITION FOR TESTING
+  RISK LEVEL HARMLESS
+  DURATION SHORT.
+
+  PRIVATE SECTION.
+
+    DATA: lo_converter TYPE REF TO lcl_currency_converter.
+
+    METHODS setup.
+    METHODS teardown.
+
+    METHODS test_happy_path FOR TESTING.
+    METHODS test_missing_parameters FOR TESTING.
+    METHODS test_boundary_values FOR TESTING.
+    METHODS test_controlled_exception FOR TESTING.
+
+ENDCLASS.
+
+CLASS ltc_currency_converter IMPLEMENTATION.
+
+  METHOD setup.
+    lo_converter = NEW lcl_currency_converter( ).
+  ENDMETHOD.
+
+  METHOD teardown.
+    CLEAR lo_converter.
+  ENDMETHOD.
+
+  METHOD test_happy_path.
+    DATA(ls_params) = VALUE lcl_currency_converter=>ty_convert_params(
+      amount_from   = 100
+      currency_from = 'EUR'
+      currency_to   = 'USD'
+      conv_date     = sy-datum
+      exch_type     = 'M'
+      company_code  = '1000'
+    ).
+    DATA(ls_result) = lo_converter->convert_amount( ls_params ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_result-status
+      exp = 'S'
+      msg = 'Expected success status'
+    ).
+    cl_abap_unit_assert=>assert_not_initial(
+      act = ls_result-amount_to
+      msg = 'Converted amount should not be initial'
+    ).
+  ENDMETHOD.
+
+  METHOD test_missing_parameters.
+    DATA(ls_params) = VALUE lcl_currency_converter=>ty_convert_params(
+      amount_from   = 100
+      currency_from = ''
+      currency_to   = 'USD'
+      conv_date     = sy-datum
+      exch_type     = 'M'
+      company_code  = '1000'
+    ).
+    DATA(ls_result) = lo_converter->convert_amount( ls_params ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_result-status
+      exp = 'E'
+      msg = 'Expected error status for missing parameters'
+    ).
+    cl_abap_unit_assert=>assert_initial(
+      act = ls_result-amount_to
+      msg = 'Amount should be initial on error'
+    ).
+  ENDMETHOD.
+
+  METHOD test_boundary_values.
+    DATA(ls_params) = VALUE lcl_currency_converter=>ty_convert_params(
+      amount_from   = 0
+      currency_from = 'EUR'
+      currency_to   = 'USD'
+      conv_date     = sy-datum
+      exch_type     = 'M'
+      company_code  = '1000'
+    ).
+    DATA(ls_result) = lo_converter->convert_amount( ls_params ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_result-status
+      exp = 'E'
+      msg = 'Expected error status for amount_from = 0'
+    ).
+    cl_abap_unit_assert=>assert_initial(
+      act = ls_result-amount_to
+      msg = 'Amount should be initial for zero input'
+    ).
+  ENDMETHOD.
+
+  METHOD test_controlled_exception.
+    DATA(ls_params) = VALUE lcl_currency_converter=>ty_convert_params(
+    amount_from   = 100
+    currency_from = 'XXX'
+    currency_to   = 'USD'
+    conv_date     = sy-datum
+    exch_type     = 'M'
+    company_code  = '1000'
+  ).
+
+    TRY.
+        DATA(ls_result) = lo_converter->convert_amount( ls_params ).
+        cl_abap_unit_assert=>assert_equals(
+          act = ls_result-status
+          exp = 'E'
+          msg = 'Expected error status for invalid currency'
+        ).
+        cl_abap_unit_assert=>assert_not_initial(
+          act = ls_result-message
+          msg = 'Error message should be returned'
+        ).
+      CATCH cx_root INTO DATA(lx).
+        cl_abap_unit_assert=>fail( 'No exception should be raised, controlled error expected.' ).
+    ENDTRY.
+  ENDMETHOD.
+
+ENDCLASS.
+
+
+START-OF-SELECTION.
+  " ================================================================
+  " Sección de pruebas - Conversor de Moneda
+  " ================================================================
+  DATA(lo_conv) = NEW lcl_currency_converter( ).
+
+  " Prueba 1: EUR a USD
+  WRITE: / '=== Prueba 1: Conversión EUR a USD ==='.
+  DATA(ls_params_1) = VALUE lcl_currency_converter=>ty_convert_params(
+    amount_from   = '2500.00'
+    currency_from = 'EUR'
+    currency_to   = 'USD'
+    conv_date     = sy-datum
+    exch_type     = 'M'
+    company_code  = '1000'
+  ).
+
+  DATA(ls_res_1) = lo_conv->convert_amount( ls_params_1 ).
+  WRITE: / 'Importe Origen:', ls_params_1-amount_from, ls_params_1-currency_from.
+  WRITE: / 'Importe Dest  :', ls_res_1-amount_to, ls_res_1-currency_to.
+  WRITE: / 'Tipo Cambio   :', ls_res_1-rate_used.
+  WRITE: / 'Estado        :', ls_res_1-status.
+  WRITE: / 'Mensaje       :', ls_res_1-message.
+  SKIP 1.
+
+  " Prueba 2: Misma moneda (USD a USD)
+  WRITE: / '=== Prueba 2: Misma Moneda (USD a USD) ==='.
+  DATA(ls_params_2) = VALUE lcl_currency_converter=>ty_convert_params(
+    amount_from   = '100.00'
+    currency_from = 'USD'
+    currency_to   = 'USD'
+    conv_date     = sy-datum
+    exch_type     = 'M'
+    company_code  = '1000'
+  ).
+
+  DATA(ls_res_2) = lo_conv->convert_amount( ls_params_2 ).
+  WRITE: / 'Importe Origen:', ls_params_2-amount_from, ls_params_2-currency_from.
+  WRITE: / 'Importe Dest  :', ls_res_2-amount_to, ls_res_2-currency_to.
+  WRITE: / 'Estado        :', ls_res_2-status.
+  WRITE: / 'Mensaje       :', ls_res_2-message.
+  SKIP 1.
+
+  " Prueba 3: Fecha inválida (futura)
+  WRITE: / '=== Prueba 3: Fecha inválida (Futura) ==='.
+  DATA(ls_params_3) = VALUE lcl_currency_converter=>ty_convert_params(
+    amount_from   = '400.00'
+    currency_from = 'EUR'
+    currency_to   = 'USD'
+    conv_date     = sy-datum + 365
+    exch_type     = 'M'
+    company_code  = '1000'
+  ).
+
+  DATA(ls_res_3) = lo_conv->convert_amount( ls_params_3 ).
+  WRITE: / 'Estado        :', ls_res_3-status.
+  WRITE: / 'Mensaje       :', ls_res_3-message.
+  SKIP 1.
+
+  " Prueba 4: Campos obligatorios faltantes
+  WRITE: / '=== Prueba 4: Campos obligatorios faltantes ==='.
+  DATA(ls_params_4) = VALUE lcl_currency_converter=>ty_convert_params(
+    amount_from   = '0'
+    currency_from = space
+    currency_to   = 'USD'
+    conv_date     = sy-datum
+    exch_type     = 'M'
+    company_code  = '1000'
+  ).
+
+  DATA(ls_res_4) = lo_conv->convert_amount( ls_params_4 ).
+  WRITE: / 'Estado        :', ls_res_4-status.
+  WRITE: / 'Mensaje       :', ls_res_4-message.
+  SKIP 1.
+
+  " Prueba 5: Integración Reporte Aging
+  WRITE: / '=== Prueba 5: Integración Reporte Aging ==='.
+  DATA(lo_rep) = NEW lcl_aging_report(
+    iv_bukrs     = '1000'
+    iv_rep_waers = 'USD'
+  ).
+
+  DATA(lt_salida) = lo_rep->get_data( ).
+
+  WRITE: / 'Registros leídos:', lines( lt_salida ).
+  IF lines( lt_salida ) > 0.
+    WRITE: / 'Primer registro:'.
+    WRITE: / '  Socio        :', lt_salida[ 1 ]-partner_id, lt_salida[ 1 ]-partner_name.
+    WRITE: / '  Importe Orig :', lt_salida[ 1 ]-amount_orig, lt_salida[ 1 ]-waers.
+    WRITE: / '  Importe Rep  :', lt_salida[ 1 ]-amount_rep, lt_salida[ 1 ]-rep_waers.
+    WRITE: / '  Días Abierto :', lt_salida[ 1 ]-days_open.
+    WRITE: / '  Bucket       :', lt_salida[ 1 ]-bucket.
+    WRITE: / '  Error Conv   :', lt_salida[ 1 ]-conv_error.
+  ENDIF.
