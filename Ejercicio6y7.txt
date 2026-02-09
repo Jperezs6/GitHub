@@ -1,0 +1,612 @@
+*&---------------------------------------------------------------------*
+*& Report ZFI_REPORT_JP - Aging Report for Customers and Vendors
+*&---------------------------------------------------------------------*
+*& Reporte de Antigüedad de Saldos para clientes y proveedores
+*&---------------------------------------------------------------------*
+REPORT zfi_report_jp.
+
+"** Type Definitions **
+TYPES: BEGIN OF ty_item_src,
+         bukrs        TYPE bukrs,      "! Sociedad
+         partner_type TYPE c LENGTH 1, "! 'K' cliente, 'L' proveedor
+         partner_id   TYPE char10,     "! KUNNR/LIFNR normalizado
+         partner_name TYPE name1,      "! Nombre del interlocutor
+         belnr        TYPE belnr_d,    "! Número de documento contable
+         buzei        TYPE buzei,      "! Posición del documento contable
+         gjahr        TYPE gjahr,      "! Ejercicio contable
+         bldat        TYPE bldat,      "! Fecha del documento
+         budat        TYPE budat,      "! Fecha de contabilización
+         waers        TYPE waers,      "! Moneda original
+         amount_orig  TYPE wrbtr,      "! Importe original
+         rep_waers    TYPE waers,      "! Moneda de reporte
+         amount_rep   TYPE wrbtr,      "! Importe convertido
+         conv_error   TYPE abap_bool,  "! Error de conversión
+         conv_msg     TYPE string,     "! Mensaje de error de conversión
+       END OF ty_item_src.
+
+TYPES: BEGIN OF ty_out,
+         bukrs        TYPE bukrs,
+         partner_type TYPE c LENGTH 1,
+         partner_id   TYPE char10,
+         partner_name TYPE name1,
+         belnr        TYPE belnr_d,
+         buzei        TYPE buzei,
+         gjahr        TYPE gjahr,
+         bldat        TYPE bldat,
+         budat        TYPE budat,
+         waers        TYPE waers,
+         amount_orig  TYPE wrbtr,
+         rep_waers    TYPE waers,
+         amount_rep   TYPE wrbtr,
+         conv_error   TYPE abap_bool,
+         conv_msg     TYPE string,
+         days_open    TYPE i,
+         bucket       TYPE c LENGTH 5,
+         traffic      TYPE c LENGTH 1,
+       END OF ty_out.
+
+TYPES: tt_item_src TYPE STANDARD TABLE OF ty_item_src WITH EMPTY KEY,
+       tt_out      TYPE STANDARD TABLE OF ty_out      WITH EMPTY KEY.
+
+TYPES: bal_t_loghndl TYPE STANDARD TABLE OF balloghndl WITH EMPTY KEY.
+
+" Tipos base para rangos (evita problemas de interpretación en firmas/SELECT-OPTIONS)
+TYPES ty_bukrs TYPE c LENGTH 4.
+TYPES ty_kunnr TYPE c LENGTH 10.
+TYPES ty_lifnr TYPE c LENGTH 10.
+TYPES ty_budat TYPE d.
+
+TYPES: BEGIN OF ty_bukrs_rng,
+         sign   TYPE c LENGTH 1,
+         option TYPE c LENGTH 2,
+         low    TYPE ty_bukrs,
+         high   TYPE ty_bukrs,
+       END OF ty_bukrs_rng.
+
+TYPES tt_bukrs_rng TYPE STANDARD TABLE OF ty_bukrs_rng WITH EMPTY KEY.
+
+TYPES: BEGIN OF ty_kunnr_rng,
+         sign   TYPE c LENGTH 1,
+         option TYPE c LENGTH 2,
+         low    TYPE ty_kunnr,
+         high   TYPE ty_kunnr,
+       END OF ty_kunnr_rng.
+
+TYPES tt_kunnr_rng TYPE STANDARD TABLE OF ty_kunnr_rng WITH EMPTY KEY.
+
+TYPES: BEGIN OF ty_lifnr_rng,
+         sign   TYPE c LENGTH 1,
+         option TYPE c LENGTH 2,
+         low    TYPE ty_lifnr,
+         high   TYPE ty_lifnr,
+       END OF ty_lifnr_rng.
+
+TYPES tt_lifnr_rng TYPE STANDARD TABLE OF ty_lifnr_rng WITH EMPTY KEY.
+TYPES: BEGIN OF ty_budat_rng,
+         sign   TYPE c LENGTH 1,
+         option TYPE c LENGTH 2,
+         low    TYPE ty_budat,
+         high   TYPE ty_budat,
+       END OF ty_budat_rng.
+TYPES tt_budat_rng TYPE STANDARD TABLE OF ty_budat_rng WITH EMPTY KEY.
+
+"----------------------------------------------------------------------
+" Currency Conversion Types
+"----------------------------------------------------------------------
+TYPES: BEGIN OF ty_conv_params,
+         amount_from   TYPE wrbtr,   " Amount to convert
+         currency_from TYPE waers,   " Source currency
+         currency_to   TYPE waers,   " Target currency
+         conv_date     TYPE budat,   " Conversion date
+         exch_type     TYPE kurst,   " Exchange rate type (default 'M')
+         company_code  TYPE bukrs,   " Company code
+       END OF ty_conv_params.
+
+TYPES: BEGIN OF ty_conversion_result,
+         amount_to TYPE wrbtr,       " Converted amount
+         rate      TYPE ukurs,       " Exchange rate used
+         status    TYPE c LENGTH 1,  " S=Success, E=Error, W=Warning
+         message   TYPE string,      " Message
+       END OF ty_conversion_result.
+
+"** Selection Screen (dummy vars para FOR) **
+DATA: gv_bukrs TYPE ty_bukrs,
+      gv_kunnr TYPE ty_kunnr,
+      gv_lifnr TYPE ty_lifnr,
+      gv_budat TYPE ty_budat.
+
+SELECTION-SCREEN BEGIN OF BLOCK blk1 WITH FRAME TITLE TEXT-001.
+  PARAMETERS: p_waers TYPE waers DEFAULT 'USD'.
+
+  SELECT-OPTIONS:
+    s_bukrs FOR gv_bukrs OBLIGATORY,
+    s_kunnr FOR gv_kunnr,
+    s_lifnr FOR gv_lifnr,
+    s_budat FOR gv_budat.
+SELECTION-SCREEN END OF BLOCK blk1.
+
+"** Data Declarations **
+DATA: lt_items  TYPE tt_item_src,
+      lt_output TYPE tt_out.
+
+"** Class Definitions **
+CLASS lcl_aging_data DEFINITION.
+  PUBLIC SECTION.
+    METHODS get_open_items
+      IMPORTING
+        it_bukrs_rng    TYPE tt_bukrs_rng
+        it_kunnr_rng    TYPE tt_kunnr_rng OPTIONAL
+        it_lifnr_rng    TYPE tt_lifnr_rng OPTIONAL
+        it_budat_rng    TYPE tt_budat_rng OPTIONAL
+      RETURNING
+        VALUE(rt_items) TYPE tt_item_src.
+ENDCLASS.
+
+CLASS lcl_aging_calc DEFINITION.
+  PUBLIC SECTION.
+    METHODS build_output
+      IMPORTING
+        it_items      TYPE tt_item_src
+        iv_repwaers   TYPE waers
+      RETURNING
+        VALUE(rt_out) TYPE tt_out.
+ENDCLASS.
+
+CLASS lcl_aging_alv DEFINITION.
+  PUBLIC SECTION.
+    METHODS display
+      IMPORTING
+        it_out TYPE tt_out.
+ENDCLASS.
+
+CLASS lcl_currency_converter DEFINITION.
+  PUBLIC SECTION.
+    METHODS convert_amount
+      IMPORTING
+        is_params TYPE ty_conv_params
+      RETURNING
+        VALUE(rs_result) TYPE ty_conversion_result.
+ENDCLASS.
+
+"----------------------------------------------------------------------
+" Clase principal de orquestación del proceso de aging
+"----------------------------------------------------------------------
+CLASS lcl_aging_service DEFINITION.
+  PUBLIC SECTION.
+    METHODS run
+      IMPORTING
+        it_bukrs_rng TYPE tt_bukrs_rng
+        it_kunnr_rng TYPE tt_kunnr_rng OPTIONAL
+        it_lifnr_rng TYPE tt_lifnr_rng OPTIONAL
+        it_budat_rng TYPE tt_budat_rng OPTIONAL
+        iv_repwaers  TYPE waers DEFAULT 'USD'
+      RETURNING
+        VALUE(rt_out) TYPE tt_out.
+ENDCLASS.
+
+CLASS lcl_aging_data IMPLEMENTATION.
+  METHOD get_open_items.
+
+    DATA lt_kunnr_rng TYPE RANGE OF ty_kunnr.
+    DATA lt_lifnr_rng TYPE RANGE OF ty_lifnr.
+    DATA lt_budat_rng TYPE RANGE OF ty_budat.
+    DATA lt_raw       TYPE STANDARD TABLE OF ty_item_src WITH EMPTY KEY.
+
+    lt_kunnr_rng = COND #( WHEN it_kunnr_rng IS INITIAL
+                           THEN VALUE #( ( sign = 'I' option = 'CP' low = '*' ) )
+                           ELSE it_kunnr_rng ).
+
+    lt_lifnr_rng = COND #( WHEN it_lifnr_rng IS INITIAL
+                           THEN VALUE #( ( sign = 'I' option = 'CP' low = '*' ) )
+                           ELSE it_lifnr_rng ).
+
+    lt_budat_rng = COND #( WHEN it_budat_rng IS INITIAL
+                           THEN VALUE #( ( sign = 'I' option = 'BT' low = '00000000' high = '99991231' ) )
+                           ELSE it_budat_rng ).
+
+    TRY.
+        SELECT
+          bseg~bukrs         AS bukrs,
+          CASE WHEN bseg~kunnr IS NOT INITIAL THEN 'K' ELSE 'L' END AS partner_type,
+          coalesce( bseg~kunnr, bseg~lifnr ) AS partner_id,
+          CASE WHEN bseg~kunnr IS NOT INITIAL THEN kna1~name1 ELSE lfa1~name1 END AS partner_name,
+          bseg~belnr         AS belnr,
+          bseg~buzei         AS buzei,
+          bseg~gjahr         AS gjahr,
+          bkpf~bldat         AS bldat,
+          bkpf~budat         AS budat,
+          bkpf~waers         AS waers,
+          bseg~dmbtr         AS amount_orig
+          FROM bseg
+          INNER JOIN bkpf
+            ON  bseg~bukrs = bkpf~bukrs
+            AND bseg~belnr = bkpf~belnr
+            AND bseg~gjahr = bkpf~gjahr
+          LEFT JOIN kna1 ON bseg~kunnr = kna1~kunnr
+          LEFT JOIN lfa1 ON bseg~lifnr = lfa1~lifnr
+          WHERE bseg~bukrs IN @it_bukrs_rng
+            AND bseg~kunnr IN @lt_kunnr_rng
+            AND bseg~lifnr IN @lt_lifnr_rng
+            AND bkpf~budat IN @lt_budat_rng
+            AND bseg~augbl IS INITIAL
+          INTO TABLE @lt_raw.
+
+        rt_items = CORRESPONDING #( lt_raw ).
+
+      CATCH cx_sy_open_sql_db INTO DATA(lx_sql).
+        CLEAR rt_items.
+        DATA(lv_msg1) = lx_sql->get_text( ).
+        PERFORM log_sql_error USING lv_msg1.
+      CATCH cx_sy_sql_error INTO DATA(lx_sql2).
+        CLEAR rt_items.
+        DATA(lv_msg2) = lx_sql2->get_text( ).
+        PERFORM log_sql_error USING lv_msg2.
+    ENDTRY.
+
+  ENDMETHOD.
+ENDCLASS.
+
+CLASS lcl_aging_calc IMPLEMENTATION.
+  METHOD build_output.
+    LOOP AT it_items INTO DATA(ls_item_src).
+      DATA(ls_item_out) = VALUE ty_out(
+        bukrs        = ls_item_src-bukrs
+        partner_type = ls_item_src-partner_type
+        partner_id   = ls_item_src-partner_id
+        partner_name = ls_item_src-partner_name
+        belnr        = ls_item_src-belnr
+        buzei        = ls_item_src-buzei
+        gjahr        = ls_item_src-gjahr
+        bldat        = ls_item_src-bldat
+        budat        = ls_item_src-budat
+        waers        = ls_item_src-waers
+        amount_orig  = ls_item_src-amount_orig
+        rep_waers    = iv_repwaers
+        amount_rep   = ls_item_src-amount_rep
+        conv_error   = ls_item_src-conv_error
+        conv_msg     = ls_item_src-conv_msg ).
+
+      IF ls_item_src-budat IS INITIAL.
+        ls_item_out-days_open = 0.
+      ELSE.
+        ls_item_out-days_open = sy-datum - ls_item_src-budat.
+      ENDIF.
+
+      IF ls_item_out-days_open <= 30.
+        ls_item_out-bucket = '0-30'.
+      ELSEIF ls_item_out-days_open <= 60.
+        ls_item_out-bucket = '31-60'.
+      ELSEIF ls_item_out-days_open <= 90.
+        ls_item_out-bucket = '61-90'.
+      ELSE.
+        ls_item_out-bucket = '>90'.
+      ENDIF.
+
+      CASE ls_item_out-bucket.
+        WHEN '0-30'.  ls_item_out-traffic = 'G'.
+        WHEN '31-60'. ls_item_out-traffic = 'Y'.
+        WHEN '61-90'. ls_item_out-traffic = 'O'.
+        WHEN '>90'.   ls_item_out-traffic = 'R'.
+        WHEN OTHERS.  ls_item_out-traffic = ''.
+      ENDCASE.
+
+      APPEND ls_item_out TO rt_out.
+    ENDLOOP.
+  ENDMETHOD.
+ENDCLASS.
+
+CLASS lcl_aging_alv IMPLEMENTATION.
+  METHOD display.
+    DATA(lt_out) = it_out.
+    DATA lo_alv TYPE REF TO cl_salv_table.
+
+    cl_salv_table=>factory(
+      IMPORTING
+        r_salv_table = lo_alv
+      CHANGING
+        t_table      = lt_out ).
+
+    lo_alv->display( ).
+  ENDMETHOD.
+ENDCLASS.
+
+CLASS ltc_currency_converter DEFINITION FOR TESTING
+  RISK LEVEL HARMLESS
+  DURATION SHORT.
+
+  PRIVATE SECTION.
+
+    DATA: lo_converter TYPE REF TO lcl_currency_converter.
+
+    METHODS setup.
+    METHODS teardown.
+
+    METHODS test_happy_path FOR TESTING.
+    METHODS test_missing_parameters FOR TESTING.
+    METHODS test_boundary_values FOR TESTING.
+    METHODS test_controlled_exception FOR TESTING.
+
+ENDCLASS.
+
+CLASS ltc_currency_converter IMPLEMENTATION.
+
+  METHOD setup.
+    lo_converter = NEW lcl_currency_converter( ).
+  ENDMETHOD.
+
+  METHOD teardown.
+    CLEAR lo_converter.
+  ENDMETHOD.
+
+  METHOD test_happy_path.
+    DATA(ls_params) = VALUE ty_conv_params(
+      amount_from   = 100
+      currency_from = 'EUR'
+      currency_to   = 'USD'
+      conv_date     = sy-datum
+      exch_type     = 'M'
+      company_code  = '1000'
+    ).
+    DATA(ls_result) = lo_converter->convert_amount( ls_params ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_result-status
+      exp = 'S'
+      msg = 'Expected success status'
+    ).
+    cl_abap_unit_assert=>assert_not_initial(
+      act = ls_result-amount_to
+      msg = 'Converted amount should not be initial'
+    ).
+  ENDMETHOD.
+
+  METHOD test_missing_parameters.
+    DATA(ls_params) = VALUE ty_conv_params(
+      amount_from   = 100
+      currency_from = ''
+      currency_to   = 'USD'
+      conv_date     = sy-datum
+      exch_type     = 'M'
+      company_code  = '1000'
+    ).
+    DATA(ls_result) = lo_converter->convert_amount( ls_params ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_result-status
+      exp = 'E'
+      msg = 'Expected error status for missing parameters'
+    ).
+    cl_abap_unit_assert=>assert_initial(
+      act = ls_result-amount_to
+      msg = 'Amount should be initial on error'
+    ).
+  ENDMETHOD.
+
+  METHOD test_boundary_values.
+    DATA(ls_params) = VALUE ty_conv_params(
+      amount_from   = 0
+      currency_from = 'EUR'
+      currency_to   = 'USD'
+      conv_date     = sy-datum
+      exch_type     = 'M'
+      company_code  = '1000'
+    ).
+    DATA(ls_result) = lo_converter->convert_amount( ls_params ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_result-status
+      exp = 'E'
+      msg = 'Expected error status for amount_from = 0'
+    ).
+    cl_abap_unit_assert=>assert_initial(
+      act = ls_result-amount_to
+      msg = 'Amount should be initial for zero input'
+    ).
+  ENDMETHOD.
+
+  METHOD test_controlled_exception.
+    DATA(ls_params) = VALUE ty_conv_params(
+      amount_from   = 100
+      currency_from = 'XXX'
+      currency_to   = 'USD'
+      conv_date     = sy-datum
+      exch_type     = 'M'
+      company_code  = '1000'
+    ).
+    TRY.
+        DATA(ls_result) = lo_converter->convert_amount( ls_params ).
+        cl_abap_unit_assert=>assert_equals(
+          act = ls_result-status
+          exp = 'E'
+          msg = 'Expected error status for invalid currency'
+        ).
+        cl_abap_unit_assert=>assert_not_initial(
+          act = ls_result-message
+          msg = 'Error message should be returned'
+        ).
+      CATCH cx_root INTO DATA(lx).
+        cl_abap_unit_assert=>fail( 'No exception should be raised, controlled error expected.' ).
+    ENDTRY.
+  ENDMETHOD.
+
+ENDCLASS.
+
+
+CLASS lcl_currency_converter IMPLEMENTATION.
+  METHOD convert_amount.
+    CLEAR rs_result.
+
+    IF is_params-currency_from IS INITIAL OR
+       is_params-currency_to IS INITIAL OR
+       is_params-amount_from IS INITIAL.
+      rs_result-status  = 'E'.
+      rs_result-message = 'Missing required parameters: currency_from, currency_to, or amount_from.'.
+      RETURN.
+    ENDIF.
+
+    IF is_params-currency_from = is_params-currency_to.
+      rs_result-amount_to = is_params-amount_from.
+      rs_result-rate      = 1.
+      rs_result-status    = 'W'.
+      rs_result-message   = 'Source and target currencies are identical. No conversion performed.'.
+      RETURN.
+    ENDIF.
+
+    DATA(lv_date)     = COND budat( WHEN is_params-conv_date IS INITIAL THEN sy-datum ELSE is_params-conv_date ).
+    DATA(lv_exchtype) = COND kurst( WHEN is_params-exch_type IS INITIAL THEN 'M' ELSE is_params-exch_type ).
+
+    TRY.
+        CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+          EXPORTING
+            date             = lv_date
+            foreign_amount   = is_params-amount_from
+            foreign_currency = is_params-currency_from
+            local_currency   = is_params-currency_to
+            rate_type        = lv_exchtype
+            company_code     = is_params-company_code
+          IMPORTING
+            local_amount     = rs_result-amount_to
+            exchange_rate    = rs_result-rate
+          EXCEPTIONS
+            OTHERS           = 1.
+
+        IF sy-subrc <> 0.
+          rs_result-status  = 'E'.
+          rs_result-message = 'Currency conversion failed (FM returned sy-subrc <> 0). Check customizing and parameters.'.
+          rs_result-amount_to = 0.
+          RETURN.
+        ENDIF.
+
+        rs_result-status  = 'S'.
+        rs_result-message = 'Conversion successful.'.
+
+      CATCH cx_root INTO DATA(lx_root).
+        rs_result-status  = 'E'.
+        rs_result-message = lx_root->get_text( ).
+        rs_result-amount_to = 0.
+    ENDTRY.
+  ENDMETHOD.
+ENDCLASS.
+
+CLASS lcl_aging_service IMPLEMENTATION.
+  METHOD run.
+    DATA lt_items      TYPE tt_item_src.
+    DATA lt_items_conv TYPE tt_item_src.
+    DATA lo_data       TYPE REF TO lcl_aging_data.
+    DATA lo_conv       TYPE REF TO lcl_currency_converter.
+    DATA lo_calc       TYPE REF TO lcl_aging_calc.
+
+    TRY.
+        lo_data = NEW lcl_aging_data( ).
+        lt_items = lo_data->get_open_items(
+          it_bukrs_rng = it_bukrs_rng
+          it_kunnr_rng = it_kunnr_rng
+          it_lifnr_rng = it_lifnr_rng
+          it_budat_rng = it_budat_rng ).
+      CATCH cx_root INTO DATA(lx_read).
+        CLEAR rt_out.
+        RETURN.
+    ENDTRY.
+
+    lo_conv = NEW lcl_currency_converter( ).
+    LOOP AT lt_items INTO DATA(ls_item).
+      DATA(ls_conv) = ls_item.
+      IF ls_item-waers = iv_repwaers.
+        ls_conv-amount_rep = ls_item-amount_orig.
+        ls_conv-conv_error = abap_false.
+        ls_conv-conv_msg   = |No conversion needed: { ls_item-waers } = { iv_repwaers }|.
+      ELSE.
+        DATA(ls_params) = VALUE ty_conv_params(
+          amount_from   = ls_item-amount_orig
+          currency_from = ls_item-waers
+          currency_to   = iv_repwaers
+          conv_date     = ls_item-budat
+          exch_type     = 'M'
+          company_code  = ls_item-bukrs
+        ).
+        TRY.
+            DATA(ls_result) = lo_conv->convert_amount( ls_params ).
+            ls_conv-amount_rep = ls_result-amount_to.
+            ls_conv-conv_error = xsdbool( ls_result-status = 'E' ).
+            ls_conv-conv_msg   = ls_result-message.
+          CATCH cx_root INTO DATA(lx_conv).
+            ls_conv-amount_rep = 0.
+            ls_conv-conv_error = abap_true.
+            ls_conv-conv_msg   = lx_conv->get_text( ).
+        ENDTRY.
+      ENDIF.
+      APPEND ls_conv TO lt_items_conv.
+    ENDLOOP.
+
+    lo_calc = NEW lcl_aging_calc( ).
+    rt_out = lo_calc->build_output(
+      it_items    = lt_items_conv
+      iv_repwaers = iv_repwaers ).
+  ENDMETHOD.
+ENDCLASS.
+
+FORM log_sql_error USING iv_msg TYPE string.
+  DATA: lv_log_handle TYPE balloghndl,
+        lt_messages   TYPE bal_t_msg,
+        ls_msg        TYPE bal_s_msg.
+
+  CALL FUNCTION 'BAL_LOG_CREATE'
+    EXPORTING
+      object     = 'ZFI_REPORT'
+      subobject  = 'SQL_ERROR'
+    IMPORTING
+      log_handle = lv_log_handle
+    EXCEPTIONS
+      OTHERS     = 1.
+
+  CLEAR ls_msg.
+  ls_msg-msgty = 'E'.
+  ls_msg-msgid = '00'.
+  ls_msg-msgno = '398'.
+  ls_msg-msgv1 = iv_msg.
+  APPEND ls_msg TO lt_messages.
+
+  CALL FUNCTION 'BAL_LOG_MSG_ADD'
+    EXPORTING
+      log_handle = lv_log_handle
+      i_s_msg    = ls_msg
+    EXCEPTIONS
+      OTHERS     = 1.
+
+  CALL FUNCTION 'BAL_DB_SAVE'
+    EXPORTING
+      i_t_log_handle = VALUE bal_t_loghndl( ( lv_log_handle ) )
+    EXCEPTIONS
+      OTHERS         = 1.
+ENDFORM.
+
+"** Main Logic **
+START-OF-SELECTION.
+
+  " Quick currency conversion test
+  DATA(lo_converter) = NEW lcl_currency_converter( ).
+
+  DATA(ls_params) = VALUE ty_conv_params(
+    amount_from   = '1000.00'
+    currency_from = 'EUR'
+    currency_to   = 'USD'
+    conv_date     = sy-datum
+    exch_type     = 'M'
+    company_code  = '1000'
+  ).
+
+  DATA(ls_result) = lo_converter->convert_amount( ls_params ).
+
+  WRITE: / 'Importe convertido:', ls_result-amount_to.
+  WRITE: / 'Tipo de cambio:', ls_result-rate.
+  WRITE: / 'Status:', ls_result-status.
+  WRITE: / 'Mensaje:', ls_result-message.
+
+
+  DATA(lo_service) = NEW lcl_aging_service( ).
+  lt_output = lo_service->run(
+    it_bukrs_rng = VALUE #( FOR ls IN s_bukrs ( ls ) )
+    it_kunnr_rng = VALUE #( FOR ls2 IN s_kunnr ( ls2 ) )
+    it_lifnr_rng = VALUE #( FOR ls3 IN s_lifnr ( ls3 ) )
+    it_budat_rng = VALUE #( FOR ls4 IN s_budat ( ls4 ) )
+    iv_repwaers  = p_waers ).
+
+  DATA(lo_alv) = NEW lcl_aging_alv( ).
+  lo_alv->display( lt_output ).
