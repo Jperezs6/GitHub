@@ -1,0 +1,2176 @@
+*&---------------------------------------------------------------------*
+*& Report ZCOPILOT_PF_JD - BP Audit and Correction System
+*&---------------------------------------------------------------------*
+REPORT zcopilot_pf_jd.
+
+*----------------------------------------------------------------------*
+* Type Definitions
+*----------------------------------------------------------------------*
+TYPES: BEGIN OF ty_bp_type_rng,
+         sign   TYPE c LENGTH 1,
+         option TYPE c LENGTH 2,
+         low    TYPE c LENGTH 1,
+         high   TYPE c LENGTH 1,
+       END OF ty_bp_type_rng.
+TYPES tt_bp_type_rng TYPE STANDARD TABLE OF ty_bp_type_rng WITH EMPTY KEY.
+
+TYPES: BEGIN OF ty_selection_criteria,
+         bp_id_rng   TYPE RANGE OF bu_partner,
+         bp_type_rng TYPE tt_bp_type_rng,
+         max_rows    TYPE i,
+       END OF ty_selection_criteria.
+
+TYPES: BEGIN OF ty_bp_context,
+         partner_id TYPE bu_partner,
+         bp_type    TYPE c LENGTH 1,
+         nit        TYPE string,
+         dpi_cui    TYPE string,
+         email      TYPE string,
+         phone      TYPE string,
+       END OF ty_bp_context.
+TYPES tt_bp_context TYPE STANDARD TABLE OF ty_bp_context WITH EMPTY KEY.
+
+TYPES: BEGIN OF ty_validation_msg,
+         partner_id     TYPE bu_partner,
+         field_name     TYPE string,
+         severity       TYPE c LENGTH 1,
+         message        TYPE string,
+         original_value TYPE string,
+         proposed_value TYPE string,
+       END OF ty_validation_msg.
+TYPES ty_t_validation_msg TYPE STANDARD TABLE OF ty_validation_msg WITH EMPTY KEY.
+
+TYPES: BEGIN OF ty_bp_change,
+         partner_id TYPE bu_partner,
+         field_name TYPE string,
+         old_value  TYPE string,
+         new_value  TYPE string,
+       END OF ty_bp_change.
+TYPES ty_t_bp_change TYPE STANDARD TABLE OF ty_bp_change WITH EMPTY KEY.
+
+TYPES ty_status TYPE c LENGTH 1.
+TYPES tt_status TYPE STANDARD TABLE OF ty_status WITH EMPTY KEY.
+
+TYPES: BEGIN OF ty_alv_line,
+         icon           TYPE icon_d,
+         partner_id     TYPE bu_partner,
+         bp_type        TYPE c LENGTH 1,
+         field_name     TYPE string,
+         severity       TYPE c LENGTH 1,
+         message        TYPE string,
+         original_value TYPE string,
+         proposed_value TYPE string,
+         t_color        TYPE lvc_t_scol,
+       END OF ty_alv_line.
+TYPES tt_alv_line TYPE STANDARD TABLE OF ty_alv_line WITH EMPTY KEY.
+
+*----------------------------------------------------------------------*
+* Selection Screen
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.
+  SELECT-OPTIONS: s_bp FOR ('BU_PARTNER').
+  PARAMETERS: p_pers RADIOBUTTON GROUP r1,
+              p_org  RADIOBUTTON GROUP r1,
+              p_all  RADIOBUTTON GROUP r1 DEFAULT 'X'.
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE TEXT-002.
+  PARAMETERS: p_sim AS CHECKBOX DEFAULT 'X',
+              p_err AS CHECKBOX.
+SELECTION-SCREEN END OF BLOCK b2.
+
+SELECTION-SCREEN BEGIN OF BLOCK b3 WITH FRAME TITLE TEXT-003.
+  PARAMETERS: p_max TYPE i DEFAULT 500.
+SELECTION-SCREEN END OF BLOCK b3.
+
+*----------------------------------------------------------------------*
+* Interfaces
+*----------------------------------------------------------------------*
+INTERFACE zif_bp_reader.
+  METHODS read_bps
+    IMPORTING it_selection  TYPE ty_selection_criteria
+    RETURNING VALUE(rt_bps) TYPE tt_bp_context.
+ENDINTERFACE.
+
+INTERFACE zif_bp_validator.
+  METHODS validate
+    IMPORTING is_bp              TYPE ty_bp_context
+    RETURNING VALUE(rt_messages) TYPE ty_t_validation_msg.
+ENDINTERFACE.
+
+INTERFACE zif_bp_updater.
+  METHODS update_bps
+    IMPORTING it_changes       TYPE ty_t_bp_change
+    RETURNING VALUE(rt_return) TYPE bapiret2_t.
+ENDINTERFACE.
+
+INTERFACE zif_audit_logger.
+  METHODS log_change
+    IMPORTING is_before TYPE ty_bp_context
+              is_after  TYPE ty_bp_context
+              it_msgs   TYPE ty_t_validation_msg.
+ENDINTERFACE.
+
+*----------------------------------------------------------------------*
+* Class: zcop_bp_reader
+*----------------------------------------------------------------------*
+CLASS zcop_bp_reader DEFINITION.
+  PUBLIC SECTION.
+    INTERFACES zif_bp_reader.
+  PRIVATE SECTION.
+    CONSTANTS gc_idtype_nit TYPE bu_id_type VALUE 'GTNIT'.
+    CONSTANTS gc_idtype_dpi TYPE bu_id_type VALUE 'GTDPI'.
+ENDCLASS.
+
+CLASS zcop_bp_reader IMPLEMENTATION.
+  METHOD zif_bp_reader~read_bps.
+    rt_bps = VALUE #( ).
+
+    DATA(lv_max) = COND i( WHEN it_selection-max_rows > 0 THEN it_selection-max_rows ELSE 500 ).
+
+    SELECT
+      b~partner                         AS partner_id,
+      b~type                            AS bp_type,
+      MAX( idn~idnumber )               AS nit,
+      MAX( idd~idnumber )               AS dpi_cui,
+      MAX( a6~smtp_addr )               AS email,
+      MAX( a2~tel_number )              AS phone
+      FROM but000 AS b
+      LEFT JOIN but0id AS idn
+        ON  idn~partner = b~partner
+        AND idn~type    = @gc_idtype_nit
+      LEFT JOIN but0id AS idd
+        ON  idd~partner = b~partner
+        AND idd~type    = @gc_idtype_dpi
+      LEFT JOIN but020 AS b20
+        ON  b20~partner = b~partner
+      LEFT JOIN adr6 AS a6
+        ON  a6~addrnumber = b20~addrnumber
+      LEFT JOIN adr2 AS a2
+        ON  a2~addrnumber = b20~addrnumber
+      WHERE b~partner IN @it_selection-bp_id_rng
+        AND b~type    IN @it_selection-bp_type_rng
+      GROUP BY b~partner, b~type
+      INTO TABLE @rt_bps.
+
+    IF lv_max > 0 AND lines( rt_bps ) > lv_max.
+      DELETE rt_bps FROM lv_max + 1.
+    ENDIF.
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* Class: zcop_bp_validator_org
+*----------------------------------------------------------------------*
+CLASS zcop_bp_validator_org DEFINITION.
+  PUBLIC SECTION.
+    INTERFACES zif_bp_validator.
+  PRIVATE SECTION.
+    METHODS normalize_nit
+      IMPORTING iv_nit        TYPE string
+      RETURNING VALUE(rv_nit) TYPE string.
+ENDCLASS.
+
+CLASS zcop_bp_validator_org IMPLEMENTATION.
+  METHOD zif_bp_validator~validate.
+    rt_messages = VALUE #( ).
+
+    DATA(lv_orig) = is_bp-nit.
+    DATA(lv_norm) = me->normalize_nit( lv_orig ).
+
+    IF lv_norm IS INITIAL.
+      rt_messages = VALUE #( (
+        partner_id     = is_bp-partner_id
+        field_name     = 'NIT'
+        severity       = 'E'
+        message        = 'NIT vacío'
+        original_value = lv_orig
+        proposed_value = ''
+      ) ).
+      RETURN.
+    ENDIF.
+
+    FIND REGEX '^\d{8,9}-\d$' IN lv_norm MATCH COUNT DATA(lv_cnt).
+    IF lv_cnt = 0.
+      rt_messages = VALUE #( (
+        partner_id     = is_bp-partner_id
+        field_name     = 'NIT'
+        severity       = 'E'
+        message        = 'Formato NIT inválido (8-9 dígitos-guion-1 dígito)'
+        original_value = lv_orig
+        proposed_value = lv_norm
+      ) ).
+      RETURN.
+    ENDIF.
+
+    IF lv_norm <> lv_orig AND lv_orig IS NOT INITIAL.
+      rt_messages = VALUE #( (
+        partner_id     = is_bp-partner_id
+        field_name     = 'NIT'
+        severity       = 'W'
+        message        = 'NIT normalizado'
+        original_value = lv_orig
+        proposed_value = lv_norm
+      ) ).
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD normalize_nit.
+    rv_nit = condense( iv_nit ).
+    REPLACE ALL OCCURRENCES OF REGEX '[^0-9-]' IN rv_nit WITH ''.
+    REPLACE ALL OCCURRENCES OF REGEX '-{2,}'  IN rv_nit WITH '-'.
+
+    IF rv_nit IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    IF rv_nit CP '*-*'.
+      RETURN.
+    ENDIF.
+
+    DATA(lv_digits) = rv_nit.
+    REPLACE ALL OCCURRENCES OF '-' IN lv_digits WITH ''.
+
+    DATA(lv_len) = strlen( lv_digits ).
+    IF lv_len < 2.
+      CLEAR rv_nit.
+      RETURN.
+    ENDIF.
+
+    DATA(lv_main_len) = lv_len - 1.
+    rv_nit = lv_digits(lv_main_len) && '-' && lv_digits+lv_main_len(1).
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* Class: zcop_bp_validator_pers
+*----------------------------------------------------------------------*
+CLASS zcop_bp_validator_pers DEFINITION.
+  PUBLIC SECTION.
+    INTERFACES zif_bp_validator.
+ENDCLASS.
+
+CLASS zcop_bp_validator_pers IMPLEMENTATION.
+  METHOD zif_bp_validator~validate.
+    rt_messages = VALUE #( ).
+
+    DATA(lv_orig) = is_bp-dpi_cui.
+    DATA(lv_norm) = lv_orig.
+    REPLACE ALL OCCURRENCES OF REGEX '[^0-9]' IN lv_norm WITH ''.
+
+    IF lv_norm IS INITIAL.
+      rt_messages = VALUE #( (
+        partner_id     = is_bp-partner_id
+        field_name     = 'DPI_CUI'
+        severity       = 'E'
+        message        = 'DPI/CUI vacío'
+        original_value = lv_orig
+        proposed_value = ''
+      ) ).
+      RETURN.
+    ENDIF.
+
+    IF strlen( lv_norm ) <> 13 OR lv_norm CN '0123456789'.
+      rt_messages = VALUE #( (
+        partner_id     = is_bp-partner_id
+        field_name     = 'DPI_CUI'
+        severity       = 'E'
+        message        = 'DPI/CUI inválido (debe ser exactamente 13 dígitos)'
+        original_value = lv_orig
+        proposed_value = lv_norm
+      ) ).
+      RETURN.
+    ENDIF.
+
+    IF lv_norm <> lv_orig.
+      rt_messages = VALUE #( (
+        partner_id     = is_bp-partner_id
+        field_name     = 'DPI_CUI'
+        severity       = 'W'
+        message        = 'DPI/CUI normalizado'
+        original_value = lv_orig
+        proposed_value = lv_norm
+      ) ).
+    ENDIF.
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* Class: zcop_bp_validator_contact
+*----------------------------------------------------------------------*
+CLASS zcop_bp_validator_contact DEFINITION.
+  PUBLIC SECTION.
+    METHODS validate_contact
+      IMPORTING is_bp              TYPE ty_bp_context
+      RETURNING VALUE(rt_messages) TYPE ty_t_validation_msg.
+  PRIVATE SECTION.
+    METHODS normalize_phone
+      IMPORTING iv_phone        TYPE string
+      RETURNING VALUE(rv_phone) TYPE string.
+ENDCLASS.
+
+CLASS zcop_bp_validator_contact IMPLEMENTATION.
+  METHOD validate_contact.
+    rt_messages = VALUE #( ).
+
+    DATA(lv_email_orig) = is_bp-email.
+    DATA(lv_email) = to_lower( condense( lv_email_orig ) ).
+
+    IF lv_email IS INITIAL.
+      APPEND VALUE ty_validation_msg(
+        partner_id     = is_bp-partner_id
+        field_name     = 'EMAIL'
+        severity       = 'E'
+        message        = 'Email vacío'
+        original_value = lv_email_orig
+        proposed_value = ''
+      ) TO rt_messages.
+    ELSE.
+      DATA(lv_at_off) = 0.
+      FIND FIRST OCCURRENCE OF '@' IN lv_email MATCH OFFSET lv_at_off.
+      DATA(lv_len) = strlen( lv_email ).
+
+      IF sy-subrc <> 0 OR lv_at_off = 0 OR lv_at_off >= lv_len - 1.
+        APPEND VALUE ty_validation_msg(
+          partner_id     = is_bp-partner_id
+          field_name     = 'EMAIL'
+          severity       = 'E'
+          message        = 'Email inválido (@)'
+          original_value = lv_email_orig
+          proposed_value = lv_email
+        ) TO rt_messages.
+      ELSE.
+        DATA lv_domain   TYPE string.
+        DATA(lv_dom_off) = lv_at_off + 1.
+        DATA(lv_dom_len) = lv_len - lv_dom_off.
+        lv_domain = lv_email+lv_dom_off(lv_dom_len).
+
+        DATA(lv_last) = substring( val = lv_domain off = strlen( lv_domain ) - 1 len = 1 ).
+
+        IF NOT ( lv_domain CS '.' ) OR lv_domain+0(1) = '.' OR lv_last = '.'.
+          APPEND VALUE ty_validation_msg(
+            partner_id     = is_bp-partner_id
+            field_name     = 'EMAIL'
+            severity       = 'E'
+            message        = 'Email inválido (dominio)'
+            original_value = lv_email_orig
+            proposed_value = lv_email
+          ) TO rt_messages.
+        ELSEIF lv_email <> lv_email_orig.
+          APPEND VALUE ty_validation_msg(
+            partner_id     = is_bp-partner_id
+            field_name     = 'EMAIL'
+            severity       = 'W'
+            message        = 'Email normalizado'
+            original_value = lv_email_orig
+            proposed_value = lv_email
+          ) TO rt_messages.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    DATA(lv_phone_orig) = is_bp-phone.
+    DATA(lv_phone_norm) = me->normalize_phone( lv_phone_orig ).
+
+    IF lv_phone_norm IS INITIAL.
+      APPEND VALUE ty_validation_msg(
+        partner_id     = is_bp-partner_id
+        field_name     = 'PHONE'
+        severity       = 'E'
+        message        = 'Teléfono vacío'
+        original_value = lv_phone_orig
+        proposed_value = ''
+      ) TO rt_messages.
+    ELSEIF lv_phone_norm CP '+502########' AND strlen( lv_phone_norm ) = 12.
+      IF lv_phone_norm <> lv_phone_orig.
+        APPEND VALUE ty_validation_msg(
+          partner_id     = is_bp-partner_id
+          field_name     = 'PHONE'
+          severity       = 'W'
+          message        = 'Teléfono normalizado'
+          original_value = lv_phone_orig
+          proposed_value = lv_phone_norm
+        ) TO rt_messages.
+      ENDIF.
+    ELSE.
+      APPEND VALUE ty_validation_msg(
+        partner_id     = is_bp-partner_id
+        field_name     = 'PHONE'
+        severity       = 'E'
+        message        = 'Teléfono inválido (esperado +502########)'
+        original_value = lv_phone_orig
+        proposed_value = lv_phone_norm
+      ) TO rt_messages.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD normalize_phone.
+    DATA(lv_digits) = iv_phone.
+    rv_phone = ''.
+
+    REPLACE ALL OCCURRENCES OF REGEX '[^0-9]' IN lv_digits WITH ''.
+
+    IF lv_digits CP '502########'.
+      rv_phone = |+{ lv_digits }|.
+      RETURN.
+    ENDIF.
+
+    IF lv_digits CP '########'.
+      rv_phone = |+502{ lv_digits }|.
+      RETURN.
+    ENDIF.
+
+    IF lv_digits CP '+502########'.
+      rv_phone = lv_digits.
+    ENDIF.
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* Class: zcop_audit_logger
+*----------------------------------------------------------------------*
+CLASS zcop_audit_logger DEFINITION.
+  PUBLIC SECTION.
+    CONSTANTS: gc_object    TYPE balobj_d  VALUE 'ZBP_AUDIT',
+               gc_subobject TYPE balsubobj VALUE 'CORRECCION'.
+
+    METHODS log_changes
+      IMPORTING it_changes TYPE ty_t_bp_change
+                it_return  TYPE bapiret2_t.
+
+    METHODS log_validation_results
+      IMPORTING it_messages TYPE ty_t_validation_msg.
+
+  PRIVATE SECTION.
+    DATA mv_log_handle TYPE balloghndl.
+
+    METHODS create_log
+      RETURNING VALUE(rv_success) TYPE abap_bool.
+
+    METHODS add_message
+      IMPORTING iv_msgty  TYPE symsgty
+                iv_msgid  TYPE symsgid DEFAULT 'ZBP_AUDIT'
+                iv_msgno  TYPE symsgno DEFAULT '000'
+                iv_msgv1  TYPE symsgv OPTIONAL
+                iv_msgv2  TYPE symsgv OPTIONAL
+                iv_msgv3  TYPE symsgv OPTIONAL
+                iv_msgv4  TYPE symsgv OPTIONAL
+                iv_detlvl TYPE ballevel DEFAULT '1'.
+
+    METHODS add_free_text
+      IMPORTING iv_text  TYPE string
+                iv_msgty TYPE symsgty DEFAULT 'I'.
+
+    METHODS save_log.
+ENDCLASS.
+
+CLASS zcop_audit_logger IMPLEMENTATION.
+  METHOD log_changes.
+    CHECK create_log( ) = abap_true.
+
+    add_free_text(
+      iv_text  = |Inicio de log de correcciones - Usuario: { sy-uname } Fecha: { sy-datum } Hora: { sy-uzeit }|
+      iv_msgty = 'I'
+    ).
+
+    LOOP AT it_changes ASSIGNING FIELD-SYMBOL(<fs_change>).
+      add_free_text(
+        iv_text  = |BP: { <fs_change>-partner_id } Campo: { <fs_change>-field_name }|
+        iv_msgty = 'I'
+      ).
+      add_free_text(
+        iv_text  = |  Valor anterior: { <fs_change>-old_value }|
+        iv_msgty = 'I'
+      ).
+      add_free_text(
+        iv_text  = |  Valor nuevo: { <fs_change>-new_value }|
+        iv_msgty = 'I'
+      ).
+    ENDLOOP.
+
+    LOOP AT it_return ASSIGNING FIELD-SYMBOL(<fs_ret>).
+      add_message(
+        iv_msgty = <fs_ret>-type
+        iv_msgid = <fs_ret>-id
+        iv_msgno = <fs_ret>-number
+        iv_msgv1 = <fs_ret>-message_v1
+        iv_msgv2 = <fs_ret>-message_v2
+        iv_msgv3 = <fs_ret>-message_v3
+        iv_msgv4 = <fs_ret>-message_v4
+      ).
+    ENDLOOP.
+
+    save_log( ).
+  ENDMETHOD.
+
+  METHOD log_validation_results.
+    CHECK create_log( ) = abap_true.
+
+    add_free_text(
+      iv_text  = |Resultados de validación - Usuario: { sy-uname } Fecha: { sy-datum }|
+      iv_msgty = 'I'
+    ).
+
+    DATA(lv_errors)   = 0.
+    DATA(lv_warnings) = 0.
+
+    LOOP AT it_messages ASSIGNING FIELD-SYMBOL(<fs_msg>).
+      DATA(lv_type) = SWITCH symsgty(
+        <fs_msg>-severity
+        WHEN 'E' THEN 'E'
+        WHEN 'W' THEN 'W'
+        ELSE 'I'
+      ).
+
+      IF <fs_msg>-severity = 'E'.
+        lv_errors = lv_errors + 1.
+      ELSEIF <fs_msg>-severity = 'W'.
+        lv_warnings = lv_warnings + 1.
+      ENDIF.
+
+      add_free_text(
+        iv_text  = |{ <fs_msg>-partner_id } - { <fs_msg>-field_name }: { <fs_msg>-message }|
+        iv_msgty = lv_type
+      ).
+    ENDLOOP.
+
+    add_free_text(
+      iv_text  = |Resumen: { lv_errors } errores, { lv_warnings } advertencias|
+      iv_msgty = 'I'
+    ).
+
+    save_log( ).
+  ENDMETHOD.
+
+  METHOD create_log.
+    DATA ls_log TYPE bal_s_log.
+
+    ls_log-object    = gc_object.
+    ls_log-subobject = gc_subobject.
+    ls_log-aluser    = sy-uname.
+    ls_log-alprog    = sy-repid.
+    ls_log-aldate    = sy-datum.
+    ls_log-altime    = sy-uzeit.
+    ls_log-altcode   = sy-tcode.
+
+    CALL FUNCTION 'BAL_LOG_CREATE'
+      EXPORTING
+        i_s_log                 = ls_log
+      IMPORTING
+        e_log_handle            = mv_log_handle
+      EXCEPTIONS
+        log_header_inconsistent = 1
+        OTHERS                  = 2.
+
+    rv_success = COND #( WHEN sy-subrc = 0 THEN abap_true ELSE abap_false ).
+  ENDMETHOD.
+
+  METHOD add_message.
+    DATA ls_msg TYPE bal_s_msg.
+
+    ls_msg-msgty    = iv_msgty.
+    ls_msg-msgid    = iv_msgid.
+    ls_msg-msgno    = iv_msgno.
+    ls_msg-msgv1    = iv_msgv1.
+    ls_msg-msgv2    = iv_msgv2.
+    ls_msg-msgv3    = iv_msgv3.
+    ls_msg-msgv4    = iv_msgv4.
+    ls_msg-detlevel = iv_detlvl.
+
+    CALL FUNCTION 'BAL_LOG_MSG_ADD'
+      EXPORTING
+        i_log_handle = mv_log_handle
+        i_s_msg      = ls_msg
+      EXCEPTIONS
+        OTHERS       = 1.
+  ENDMETHOD.
+
+  METHOD add_free_text.
+    DATA ls_msg TYPE bal_s_msg.
+
+    ls_msg-msgty = iv_msgty.
+    ls_msg-msgid = 'ZBP_AUDIT'.
+    ls_msg-msgno = '000'.
+    ls_msg-msgv1 = iv_text(50).
+
+    IF strlen( iv_text ) > 50.
+      ls_msg-msgv2 = iv_text+50(50).
+    ENDIF.
+    IF strlen( iv_text ) > 100.
+      ls_msg-msgv3 = iv_text+100(50).
+    ENDIF.
+    IF strlen( iv_text ) > 150.
+      ls_msg-msgv4 = iv_text+150(50).
+    ENDIF.
+
+    CALL FUNCTION 'BAL_LOG_MSG_ADD'
+      EXPORTING
+        i_log_handle = mv_log_handle
+        i_s_msg      = ls_msg
+      EXCEPTIONS
+        OTHERS       = 1.
+  ENDMETHOD.
+
+  METHOD save_log.
+    DATA lt_log_handle TYPE bal_t_logh.
+
+    APPEND mv_log_handle TO lt_log_handle.
+
+    CALL FUNCTION 'BAL_DB_SAVE'
+      EXPORTING
+        i_t_log_handle   = lt_log_handle
+        i_save_all       = abap_true
+      EXCEPTIONS
+        log_not_found    = 1
+        save_not_allowed = 2
+        numbering_error  = 3
+        OTHERS           = 4.
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* Class: zcop_bp_transaction_manager
+*----------------------------------------------------------------------*
+CLASS zcop_bp_transaction_manager DEFINITION.
+  PUBLIC SECTION.
+    METHODS execute_changes
+      IMPORTING it_changes       TYPE ty_t_bp_change
+      RETURNING VALUE(rt_return) TYPE bapiret2_t.
+
+    METHODS set_simulation_mode
+      IMPORTING iv_simulation TYPE abap_bool.
+
+  PRIVATE SECTION.
+    DATA mv_simulation TYPE abap_bool VALUE abap_true.
+
+    METHODS update_bp_identification
+      IMPORTING is_change        TYPE ty_bp_change
+      RETURNING VALUE(rt_return) TYPE bapiret2_t.
+
+    METHODS update_bp_address_data
+      IMPORTING is_change        TYPE ty_bp_change
+      RETURNING VALUE(rt_return) TYPE bapiret2_t.
+
+    METHODS commit_work
+      RETURNING VALUE(rv_success) TYPE abap_bool.
+
+    METHODS rollback_work.
+ENDCLASS.
+
+CLASS zcop_bp_transaction_manager IMPLEMENTATION.
+  METHOD execute_changes.
+    DATA lt_single_return TYPE bapiret2_t.
+    DATA lv_has_error     TYPE abap_bool VALUE abap_false.
+
+    LOOP AT it_changes ASSIGNING FIELD-SYMBOL(<fs_change>).
+      CASE <fs_change>-field_name.
+        WHEN 'NIT' OR 'DPI_CUI'.
+          lt_single_return = update_bp_identification( <fs_change> ).
+        WHEN 'EMAIL' OR 'PHONE'.
+          lt_single_return = update_bp_address_data( <fs_change> ).
+        WHEN OTHERS.
+          APPEND VALUE bapiret2(
+            type       = 'W'
+            id         = 'ZBP'
+            number     = '001'
+            message    = |Campo { <fs_change>-field_name } no soportado|
+            message_v1 = CONV #( <fs_change>-partner_id )
+          ) TO rt_return.
+          CONTINUE.
+      ENDCASE.
+
+      APPEND LINES OF lt_single_return TO rt_return.
+
+      LOOP AT lt_single_return TRANSPORTING NO FIELDS WHERE type = 'E' OR type = 'A'.
+        lv_has_error = abap_true.
+        EXIT.
+      ENDLOOP.
+    ENDLOOP.
+
+    IF mv_simulation = abap_true.
+      APPEND VALUE bapiret2(
+        type    = 'I'
+        id      = 'ZBP'
+        number  = '002'
+        message = 'Modo simulación - cambios no aplicados'
+      ) TO rt_return.
+      RETURN.
+    ENDIF.
+
+    IF lv_has_error = abap_true.
+      rollback_work( ).
+      APPEND VALUE bapiret2(
+        type    = 'E'
+        id      = 'ZBP'
+        number  = '003'
+        message = 'Rollback ejecutado por errores'
+      ) TO rt_return.
+    ELSE.
+      IF commit_work( ) = abap_true.
+        APPEND VALUE bapiret2(
+          type    = 'S'
+          id      = 'ZBP'
+          number  = '004'
+          message = 'Cambios guardados exitosamente'
+        ) TO rt_return.
+      ELSE.
+        APPEND VALUE bapiret2(
+          type    = 'E'
+          id      = 'ZBP'
+          number  = '005'
+          message = 'Error en commit'
+        ) TO rt_return.
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD set_simulation_mode.
+    mv_simulation = iv_simulation.
+  ENDMETHOD.
+
+METHOD update_bp_identification.
+  DATA lt_return_temp      TYPE bapiret2_t.
+  DATA ls_identification   TYPE bapibus1006_identification.
+  DATA ls_identification_x TYPE bapibus1006_identification_x.
+
+  DATA lv_id_type TYPE bu_id_type.
+  DATA lv_old_db  TYPE bu_id_number.
+  DATA lv_has_old TYPE abap_bool.
+
+  FIELD-SYMBOLS: <fs_type>   TYPE any,
+                 <fs_number> TYPE any,
+                 <fs_x_type> TYPE any,
+                 <fs_x_num>  TYPE any.
+
+  lv_id_type = COND bu_id_type(
+    WHEN is_change-field_name = 'NIT' THEN 'GTNIT'
+    ELSE 'GTDPI'
+  ).
+
+  CLEAR lt_return_temp.
+
+  IF is_change-new_value IS INITIAL.
+    APPEND VALUE bapiret2(
+      type    = 'E'
+      id      = 'ZBP'
+      number  = '010'
+      message = |Valor nuevo vacío para { is_change-field_name }|
+      message_v1 = CONV #( is_change-partner_id )
+    ) TO lt_return_temp.
+    rt_return = lt_return_temp.
+    RETURN.
+  ENDIF.
+
+  "Leer el ID actual REAL en BD (para llave del CHANGE)
+  CLEAR: lv_old_db, lv_has_old.
+  SELECT SINGLE idnumber
+    FROM but0id
+    WHERE partner = @is_change-partner_id
+      AND type    = @lv_id_type
+    INTO @lv_old_db.
+  lv_has_old = xsdbool( sy-subrc = 0 ).
+
+  "Preparar payload IDENTIFICATION / IDENTIFICATION_X (sin asumir nombres)
+  CLEAR: ls_identification, ls_identification_x.
+  CLEAR: <fs_type>, <fs_number>, <fs_x_type>, <fs_x_num>.
+
+  "---- Buscar campo de TIPO en IDENTIFICATION
+  ASSIGN COMPONENT 'IDENTIFICATIONCATEGORY' OF STRUCTURE ls_identification TO <fs_type>.
+  IF sy-subrc <> 0. ASSIGN COMPONENT 'IDENTIFICATIONTYPE' OF STRUCTURE ls_identification TO <fs_type>. ENDIF.
+  IF sy-subrc <> 0. ASSIGN COMPONENT 'IDTYPE'             OF STRUCTURE ls_identification TO <fs_type>. ENDIF.
+  IF sy-subrc <> 0. ASSIGN COMPONENT 'TYPE'               OF STRUCTURE ls_identification TO <fs_type>. ENDIF.
+
+  "---- Buscar campo de NÚMERO en IDENTIFICATION
+  ASSIGN COMPONENT 'IDENTIFICATIONNUMBER' OF STRUCTURE ls_identification TO <fs_number>.
+  IF sy-subrc <> 0. ASSIGN COMPONENT 'IDNUMBER'            OF STRUCTURE ls_identification TO <fs_number>. ENDIF.
+  IF sy-subrc <> 0. ASSIGN COMPONENT 'IDENTIFICATIONNO'    OF STRUCTURE ls_identification TO <fs_number>. ENDIF.
+  IF sy-subrc <> 0. ASSIGN COMPONENT 'NUMBER'              OF STRUCTURE ls_identification TO <fs_number>. ENDIF.
+
+  IF <fs_type> IS NOT ASSIGNED OR <fs_number> IS NOT ASSIGNED.
+    APPEND VALUE bapiret2(
+      type    = 'E'
+      id      = 'ZBP'
+      number  = '020'
+      message = 'No se encontraron campos de tipo/número en BAPIBUS1006_IDENTIFICATION (revisar SE11)'
+      message_v1 = CONV #( is_change-partner_id )
+    ) TO lt_return_temp.
+    rt_return = lt_return_temp.
+    RETURN.
+  ENDIF.
+
+  <fs_type>   = lv_id_type.
+  <fs_number> = is_change-new_value.
+
+  "---- Marcar X: tipo/número (si existen)
+  ASSIGN COMPONENT 'IDENTIFICATIONCATEGORY' OF STRUCTURE ls_identification_x TO <fs_x_type>.
+  IF sy-subrc <> 0. ASSIGN COMPONENT 'IDENTIFICATIONTYPE' OF STRUCTURE ls_identification_x TO <fs_x_type>. ENDIF.
+  IF sy-subrc <> 0. ASSIGN COMPONENT 'IDTYPE'             OF STRUCTURE ls_identification_x TO <fs_x_type>. ENDIF.
+  IF sy-subrc <> 0. ASSIGN COMPONENT 'TYPE'               OF STRUCTURE ls_identification_x TO <fs_x_type>. ENDIF.
+
+  ASSIGN COMPONENT 'IDENTIFICATIONNUMBER' OF STRUCTURE ls_identification_x TO <fs_x_num>.
+  IF sy-subrc <> 0. ASSIGN COMPONENT 'IDNUMBER'            OF STRUCTURE ls_identification_x TO <fs_x_num>. ENDIF.
+  IF sy-subrc <> 0. ASSIGN COMPONENT 'IDENTIFICATIONNO'    OF STRUCTURE ls_identification_x TO <fs_x_num>. ENDIF.
+  IF sy-subrc <> 0. ASSIGN COMPONENT 'NUMBER'              OF STRUCTURE ls_identification_x TO <fs_x_num>. ENDIF.
+
+  IF <fs_x_type> IS ASSIGNED. <fs_x_type> = abap_true. ENDIF.
+  IF <fs_x_num>  IS ASSIGNED. <fs_x_num>  = abap_true. ENDIF.
+
+  "Si ya está igual, no hacer nada
+  IF lv_has_old = abap_true AND lv_old_db = is_change-new_value.
+    APPEND VALUE bapiret2(
+      type    = 'S'
+      id      = 'ZBP'
+      number  = '012'
+      message = |Sin cambios: { is_change-field_name } ya está actualizado|
+      message_v1 = CONV #( is_change-partner_id )
+    ) TO lt_return_temp.
+    rt_return = lt_return_temp.
+    RETURN.
+  ENDIF.
+
+  "CHANGE si existe; ADD si no existe
+  IF lv_has_old = abap_true.
+    CALL FUNCTION 'BAPI_IDENTIFICATION_CHANGE'
+      EXPORTING
+        businesspartner        = is_change-partner_id
+        identificationcategory = lv_id_type
+        identificationnumber   = lv_old_db
+        identification         = ls_identification
+        identification_x       = ls_identification_x
+      TABLES
+        return                 = lt_return_temp.
+  ELSE.
+    CALL FUNCTION 'BAPI_BUPA_IDENTIFICATION_ADD'
+      EXPORTING
+        businesspartner = is_change-partner_id
+        identification  = ls_identification
+      TABLES
+        return          = lt_return_temp.
+  ENDIF.
+
+  rt_return = lt_return_temp.
+ENDMETHOD.
+
+
+METHOD update_bp_address_data.
+  DATA lt_return_temp TYPE bapiret2_t.
+  DATA ls_central TYPE bapibus1006_central.
+  DATA ls_central_x TYPE bapibus1006_central_x.
+
+  CASE is_change-field_name.
+    WHEN 'EMAIL'.
+      DATA lt_email TYPE TABLE OF bapiadsmtp.
+      DATA lt_email_x TYPE TABLE OF bapiadsmtx.
+
+      APPEND VALUE bapiadsmtp(
+        e_mail = is_change-new_value
+        std_no = 'X'
+      ) TO lt_email.
+
+      APPEND VALUE bapiadsmtx(
+        e_mail = 'X'
+        std_no = 'X'
+      ) TO lt_email_x.
+
+      CALL FUNCTION 'BAPI_BUPA_CENTRAL_CHANGE'
+        EXPORTING
+          businesspartner = is_change-partner_id
+          centraldata     = ls_central
+          centraldata_x   = ls_central_x
+        TABLES
+          e_maildatanonaddress  = lt_email
+          e_maildatanonaddressx = lt_email_x
+          return                = lt_return_temp.
+
+    WHEN 'PHONE'.
+      DATA lt_phone TYPE TABLE OF bapiadtel.
+      DATA lt_phone_x TYPE TABLE OF bapiadtelx.
+
+      APPEND VALUE bapiadtel(
+        telephone = is_change-new_value
+        std_no    = 'X'
+      ) TO lt_phone.
+
+      APPEND VALUE bapiadtelx(
+        telephone = 'X'
+        std_no    = 'X'
+      ) TO lt_phone_x.
+
+      CALL FUNCTION 'BAPI_BUPA_CENTRAL_CHANGE'
+        EXPORTING
+          businesspartner = is_change-partner_id
+          centraldata     = ls_central
+          centraldata_x   = ls_central_x
+        TABLES
+          telefondatanonaddress  = lt_phone
+          telefondatanonaddressx = lt_phone_x
+          return                 = lt_return_temp.
+  ENDCASE.
+
+  rt_return = lt_return_temp.
+ENDMETHOD.
+
+
+  METHOD commit_work.
+    DATA lv_return TYPE bapiret2.
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait   = abap_true
+      IMPORTING
+        return = lv_return.
+
+    rv_success = COND #( WHEN lv_return-type CA 'EA' THEN abap_false ELSE abap_true ).
+  ENDMETHOD.
+
+  METHOD rollback_work.
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+  ENDMETHOD.
+ENDCLASS.
+
+
+
+*----------------------------------------------------------------------*
+* Class: zcop_bp_alv_view
+*----------------------------------------------------------------------*
+CLASS zcop_bp_alv_view DEFINITION.
+  PUBLIC SECTION.
+    METHODS set_data
+      IMPORTING it_messages    TYPE ty_t_validation_msg
+                iv_errors_only TYPE abap_bool DEFAULT abap_false.
+
+    METHODS display.
+
+  PRIVATE SECTION.
+    DATA mt_alv_data TYPE tt_alv_line.
+    DATA mo_salv     TYPE REF TO cl_salv_table.
+
+    METHODS prepare_alv_data
+      IMPORTING it_messages    TYPE ty_t_validation_msg
+                iv_errors_only TYPE abap_bool.
+
+    METHODS get_status_icon
+      IMPORTING iv_severity    TYPE c
+      RETURNING VALUE(rv_icon) TYPE icon_d.
+
+    METHODS configure_columns.
+    METHODS configure_display_settings.
+    METHODS configure_functions.
+ENDCLASS.
+
+CLASS zcop_bp_alv_view IMPLEMENTATION.
+  METHOD set_data.
+    prepare_alv_data(
+      it_messages    = it_messages
+      iv_errors_only = iv_errors_only
+    ).
+  ENDMETHOD.
+
+  METHOD display.
+    TRY.
+        cl_salv_table=>factory(
+          IMPORTING r_salv_table = mo_salv
+          CHANGING  t_table      = mt_alv_data
+        ).
+
+        configure_columns( ).
+        configure_display_settings( ).
+        configure_functions( ).
+
+        mo_salv->display( ).
+
+      CATCH cx_salv_msg INTO DATA(lx_msg).
+        MESSAGE lx_msg TYPE 'E'.
+    ENDTRY.
+  ENDMETHOD.
+
+  METHOD prepare_alv_data.
+    CLEAR mt_alv_data.
+
+    LOOP AT it_messages ASSIGNING FIELD-SYMBOL(<fs_msg>).
+      IF iv_errors_only = abap_true AND <fs_msg>-severity <> 'E'.
+        CONTINUE.
+      ENDIF.
+
+      APPEND VALUE ty_alv_line(
+        icon           = get_status_icon( <fs_msg>-severity )
+        partner_id     = <fs_msg>-partner_id
+        field_name     = <fs_msg>-field_name
+        severity       = <fs_msg>-severity
+        message        = <fs_msg>-message
+        original_value = <fs_msg>-original_value
+        proposed_value = <fs_msg>-proposed_value
+      ) TO mt_alv_data.
+    ENDLOOP.
+  ENDMETHOD.
+
+  METHOD get_status_icon.
+    rv_icon = SWITCH #( iv_severity
+      WHEN 'S' THEN icon_led_green
+      WHEN 'W' THEN icon_led_yellow
+      WHEN 'E' THEN icon_led_red
+      ELSE icon_led_inactive
+    ).
+  ENDMETHOD.
+
+  METHOD configure_columns.
+    DATA(lo_columns) = mo_salv->get_columns( ).
+    lo_columns->set_optimize( abap_true ).
+
+    TRY.
+        DATA(lo_col_icon) = lo_columns->get_column( 'ICON' ).
+        lo_col_icon->set_short_text( 'Estado' ).
+        lo_col_icon->set_medium_text( 'Estado' ).
+        lo_col_icon->set_long_text( 'Estado' ).
+
+        DATA(lo_col_bp) = lo_columns->get_column( 'PARTNER_ID' ).
+        lo_col_bp->set_short_text( 'BP' ).
+        lo_col_bp->set_medium_text( 'Business Partner' ).
+
+        DATA(lo_col_field) = lo_columns->get_column( 'FIELD_NAME' ).
+        lo_col_field->set_short_text( 'Campo' ).
+        lo_col_field->set_medium_text( 'Nombre Campo' ).
+
+        DATA(lo_col_orig) = lo_columns->get_column( 'ORIGINAL_VALUE' ).
+        lo_col_orig->set_short_text( 'Actual' ).
+        lo_col_orig->set_medium_text( 'Valor Actual' ).
+
+        DATA(lo_col_prop) = lo_columns->get_column( 'PROPOSED_VALUE' ).
+        lo_col_prop->set_short_text( 'Corregido' ).
+        lo_col_prop->set_medium_text( 'Valor Corregido' ).
+
+        DATA(lo_col_sev) = lo_columns->get_column( 'SEVERITY' ).
+        lo_col_sev->set_visible( abap_false ).
+
+        DATA(lo_col_color) = lo_columns->get_column( 'T_COLOR' ).
+        lo_col_color->set_visible( abap_false ).
+
+        DATA(lo_col_type) = lo_columns->get_column( 'BP_TYPE' ).
+        lo_col_type->set_short_text( 'Tipo' ).
+        lo_col_type->set_medium_text( 'Tipo BP' ).
+
+      CATCH cx_salv_not_found.
+        " Column not found - ignore
+    ENDTRY.
+  ENDMETHOD.
+
+  METHOD configure_display_settings.
+    DATA(lo_display) = mo_salv->get_display_settings( ).
+    lo_display->set_striped_pattern( abap_true ).
+    lo_display->set_list_header( 'Resultados de Auditoría BP' ).
+  ENDMETHOD.
+
+  METHOD configure_functions.
+    DATA(lo_functions) = mo_salv->get_functions( ).
+    lo_functions->set_all( abap_true ).
+
+    DATA(lo_sorts) = mo_salv->get_sorts( ).
+    TRY.
+        lo_sorts->add_sort(
+          columnname = 'SEVERITY'
+          position   = 1
+          sequence   = if_salv_c_sort=>sort_down
+        ).
+      CATCH cx_salv_not_found cx_salv_existing cx_salv_data_error.
+        " Ignore sort errors
+    ENDTRY.
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* Class: zcop_bp_audit_orchestrator
+*----------------------------------------------------------------------*
+CLASS zcop_bp_audit_orchestrator DEFINITION.
+  PUBLIC SECTION.
+    METHODS run_audit
+      IMPORTING it_selection TYPE ty_selection_criteria.
+    DATA: gt_bp_results      TYPE tt_bp_context,
+          gt_validation_msgs TYPE ty_t_validation_msg,
+          gt_bp_changes      TYPE ty_t_bp_change,
+          gt_bp_status       TYPE tt_status.
+ENDCLASS.
+
+CLASS zcop_bp_audit_orchestrator IMPLEMENTATION.
+  METHOD run_audit.
+    DATA(lo_reader)            = NEW zcop_bp_reader( ).
+    DATA(lo_validator_org)     = NEW zcop_bp_validator_org( ).
+    DATA(lo_validator_pers)    = NEW zcop_bp_validator_pers( ).
+    DATA(lo_validator_contact) = NEW zcop_bp_validator_contact( ).
+
+    gt_bp_results = lo_reader->zif_bp_reader~read_bps( it_selection ).
+
+    CLEAR: gt_validation_msgs, gt_bp_changes, gt_bp_status.
+
+    LOOP AT gt_bp_results ASSIGNING FIELD-SYMBOL(<fs_bp>).
+      DATA lt_msgs TYPE ty_t_validation_msg.
+
+      CASE <fs_bp>-bp_type.
+        WHEN '1'.
+          lt_msgs = lo_validator_pers->zif_bp_validator~validate( <fs_bp> ).
+        WHEN '2'.
+          lt_msgs = lo_validator_org->zif_bp_validator~validate( <fs_bp> ).
+        WHEN OTHERS.
+          APPEND VALUE ty_validation_msg(
+            partner_id     = <fs_bp>-partner_id
+            field_name     = 'BP_TYPE'
+            severity       = 'E'
+            message        = 'Unknown BP type'
+            original_value = <fs_bp>-bp_type
+            proposed_value = ''
+          ) TO lt_msgs.
+      ENDCASE.
+
+      DATA(lt_contact_msgs) = lo_validator_contact->validate_contact( <fs_bp> ).
+      APPEND LINES OF lt_contact_msgs TO lt_msgs.
+
+      APPEND LINES OF lt_msgs TO gt_validation_msgs.
+
+      LOOP AT lt_msgs ASSIGNING FIELD-SYMBOL(<fs_msg>).
+        IF <fs_msg>-proposed_value IS NOT INITIAL
+           AND <fs_msg>-proposed_value <> <fs_msg>-original_value.
+          APPEND VALUE ty_bp_change(
+            partner_id = <fs_msg>-partner_id
+            field_name = <fs_msg>-field_name
+            old_value  = <fs_msg>-original_value
+            new_value  = <fs_msg>-proposed_value
+          ) TO gt_bp_changes.
+        ENDIF.
+      ENDLOOP.
+
+      DATA lt_e TYPE ty_t_validation_msg.
+      CLEAR lt_e.
+
+      LOOP AT lt_msgs ASSIGNING FIELD-SYMBOL(<fs_msg2>) WHERE severity = 'E'.
+        APPEND <fs_msg2> TO lt_e.
+      ENDLOOP.
+
+      DATA lt_w TYPE ty_t_validation_msg.
+      CLEAR lt_w.
+
+      LOOP AT lt_msgs ASSIGNING FIELD-SYMBOL(<fs_msg3>) WHERE severity = 'W'.
+        APPEND <fs_msg3> TO lt_w.
+      ENDLOOP.
+
+      DATA(l_status) = COND ty_status(
+        WHEN lines( lt_e ) > 0 THEN 'E'
+        WHEN lines( lt_w ) > 0 THEN 'W'
+        ELSE 'S'
+      ).
+      APPEND l_status TO gt_bp_status.
+    ENDLOOP.
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* Local Classes for Selection and Controller
+*----------------------------------------------------------------------*
+CLASS lcl_selection_builder DEFINITION.
+  PUBLIC SECTION.
+    METHODS build_criteria
+      RETURNING VALUE(rs_criteria) TYPE ty_selection_criteria.
+ENDCLASS.
+
+CLASS lcl_selection_builder IMPLEMENTATION.
+  METHOD build_criteria.
+    rs_criteria-bp_id_rng = s_bp[].
+    rs_criteria-max_rows  = p_max.
+
+    CASE abap_true.
+      WHEN p_pers.
+        rs_criteria-bp_type_rng = VALUE #( ( sign = 'I' option = 'EQ' low = '1' ) ).
+      WHEN p_org.
+        rs_criteria-bp_type_rng = VALUE #( ( sign = 'I' option = 'EQ' low = '2' ) ).
+      WHEN p_all.
+        rs_criteria-bp_type_rng = VALUE #(
+          ( sign = 'I' option = 'EQ' low = '1' )
+          ( sign = 'I' option = 'EQ' low = '2' )
+        ).
+    ENDCASE.
+  ENDMETHOD.
+ENDCLASS.
+
+CLASS lcl_main_controller DEFINITION.
+  PUBLIC SECTION.
+    METHODS run.
+  PRIVATE SECTION.
+    DATA mo_orchestrator TYPE REF TO zcop_bp_audit_orchestrator.
+    DATA mo_alv_view     TYPE REF TO zcop_bp_alv_view.
+    DATA mo_trans_mgr    TYPE REF TO zcop_bp_transaction_manager.
+    DATA mo_logger       TYPE REF TO zcop_audit_logger.
+
+    METHODS execute_corrections
+      IMPORTING it_changes TYPE ty_t_bp_change.
+ENDCLASS.
+
+CLASS lcl_main_controller IMPLEMENTATION.
+  METHOD run.
+    DATA(lo_builder) = NEW lcl_selection_builder( ).
+    DATA(ls_criteria) = lo_builder->build_criteria( ).
+
+    mo_orchestrator = NEW zcop_bp_audit_orchestrator( ).
+    mo_orchestrator->run_audit( ls_criteria ).
+
+    " Log validation results
+    mo_logger = NEW zcop_audit_logger( ).
+    mo_logger->log_validation_results( mo_orchestrator->gt_validation_msgs ).
+
+    " Display ALV
+    mo_alv_view = NEW zcop_bp_alv_view( ).
+    mo_alv_view->set_data(
+      it_messages    = mo_orchestrator->gt_validation_msgs
+      iv_errors_only = p_err
+    ).
+
+    mo_alv_view->display( ).
+
+    " Execute corrections if not in simulation mode
+    IF p_sim = abap_false AND mo_orchestrator->gt_bp_changes IS NOT INITIAL.
+      execute_corrections( mo_orchestrator->gt_bp_changes ).
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD execute_corrections.
+    mo_trans_mgr = NEW zcop_bp_transaction_manager( ).
+    mo_trans_mgr->set_simulation_mode( p_sim ).
+
+    DATA(lt_return) = mo_trans_mgr->execute_changes( it_changes ).
+
+    mo_logger->log_changes(
+      it_changes = it_changes
+      it_return  = lt_return
+    ).
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* Test Classes - ABAP Unit
+*----------------------------------------------------------------------*
+
+*----------------------------------------------------------------------*
+* Helper Class for Test Data
+*----------------------------------------------------------------------*
+CLASS ltcl_test_helper DEFINITION FOR TESTING.
+  PUBLIC SECTION.
+    CLASS-METHODS create_bp_context
+      IMPORTING iv_partner_id    TYPE bu_partner DEFAULT '0000000001'
+                iv_bp_type       TYPE c DEFAULT '2'
+                iv_nit           TYPE string DEFAULT ''
+                iv_dpi_cui       TYPE string DEFAULT ''
+                iv_email         TYPE string DEFAULT ''
+                iv_phone         TYPE string DEFAULT ''
+      RETURNING VALUE(rs_bp_ctx) TYPE ty_bp_context.
+ENDCLASS.
+
+CLASS ltcl_test_helper IMPLEMENTATION.
+  METHOD create_bp_context.
+    rs_bp_ctx = VALUE ty_bp_context(
+      partner_id = iv_partner_id
+      bp_type    = iv_bp_type
+      nit        = iv_nit
+      dpi_cui    = iv_dpi_cui
+      email      = iv_email
+      phone      = iv_phone
+    ).
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* Test Class: LTCL_TEST_NIT
+*----------------------------------------------------------------------*
+CLASS ltcl_test_nit DEFINITION FOR TESTING
+  DURATION SHORT
+  RISK LEVEL HARMLESS.
+
+  PRIVATE SECTION.
+    DATA mo_validator TYPE REF TO zcop_bp_validator_org.
+    DATA mt_messages  TYPE ty_t_validation_msg.
+
+    METHODS setup.
+
+    " GIVEN valid NIT formats
+    METHODS valid_nit_8digits FOR TESTING.
+    METHODS valid_nit_9digits FOR TESTING.
+
+    " GIVEN invalid NIT formats
+    METHODS given_empty_nit_then_error FOR TESTING.
+    METHODS given_nit_no_dash_then_warn FOR TESTING.
+    METHODS given_nit_letters_then_error FOR TESTING.
+    METHODS given_nit_too_short_then_error FOR TESTING.
+    METHODS given_nit_too_long_then_error FOR TESTING.
+
+    " GIVEN NIT needing normalization
+    METHODS given_nit_spaces_then_warning FOR TESTING.
+    METHODS nit_special_chars FOR TESTING.
+ENDCLASS.
+
+CLASS ltcl_test_nit IMPLEMENTATION.
+  METHOD setup.
+    mo_validator = NEW zcop_bp_validator_org( ).
+    CLEAR mt_messages.
+  ENDMETHOD.
+
+  METHOD valid_nit_8digits.
+    " GIVEN: Valid NIT with 8 digits + dash + 1 digit
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_nit = '12345678-9'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: No error messages
+    cl_abap_unit_assert=>assert_initial(
+      act = mt_messages
+      msg = 'Valid 8-digit NIT should produce no messages'
+    ).
+  ENDMETHOD.
+
+  METHOD valid_nit_9digits.
+    " GIVEN: Valid NIT with 9 digits + dash + 1 digit
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_nit = '123456789-0'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: No error messages
+    cl_abap_unit_assert=>assert_initial(
+      act = mt_messages
+      msg = 'Valid 9-digit NIT should produce no messages'
+    ).
+  ENDMETHOD.
+
+  METHOD given_empty_nit_then_error.
+    " GIVEN: Empty NIT
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_nit = ''
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: Error message
+    cl_abap_unit_assert=>assert_equals(
+      act = lines( mt_messages )
+      exp = 1
+      msg = 'Empty NIT should produce 1 message'
+    ).
+
+    READ TABLE mt_messages INTO DATA(ls_msg) INDEX 1.
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'Empty NIT should be error'
+    ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-field_name
+      exp = 'NIT'
+      msg = 'Field name should be NIT'
+    ).
+  ENDMETHOD.
+
+  METHOD given_nit_no_dash_then_warn.
+    " GIVEN: NIT without dash (needs normalization)
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_nit = '123456789'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: Warning with normalized value
+    cl_abap_unit_assert=>assert_equals(
+      act = lines( mt_messages )
+      exp = 1
+      msg = 'NIT without dash should produce 1 message'
+    ).
+
+    READ TABLE mt_messages INTO DATA(ls_msg) INDEX 1.
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'W'
+      msg = 'NIT normalization should be warning'
+    ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-proposed_value
+      exp = '12345678-9'
+      msg = 'Proposed value should be normalized NIT'
+    ).
+  ENDMETHOD.
+
+  METHOD given_nit_letters_then_error.
+    " GIVEN: NIT with letters
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_nit = '1234ABC8-9'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: Error message
+    cl_abap_unit_assert=>assert_not_initial(
+      act = mt_messages
+      msg = 'NIT with letters should produce messages'
+    ).
+
+    READ TABLE mt_messages INTO DATA(ls_msg) INDEX 1.
+    cl_abap_unit_assert=>assert_true(
+      act = xsdbool( ls_msg-severity = 'E' OR ls_msg-severity = 'W' )
+      msg = 'NIT with letters should produce error or warning'
+    ).
+  ENDMETHOD.
+
+  METHOD given_nit_too_short_then_error.
+    " GIVEN: NIT too short (less than 8 main digits)
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_nit = '1234-5'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: Error message
+    cl_abap_unit_assert=>assert_not_initial(
+      act = mt_messages
+      msg = 'Short NIT should produce messages'
+    ).
+
+    READ TABLE mt_messages INTO DATA(ls_msg) INDEX 1.
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'Short NIT should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD given_nit_too_long_then_error.
+    " GIVEN: NIT too long (more than 9 main digits)
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_nit = '1234567890-1'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: Error message
+    cl_abap_unit_assert=>assert_not_initial(
+      act = mt_messages
+      msg = 'Long NIT should produce messages'
+    ).
+
+    READ TABLE mt_messages INTO DATA(ls_msg) INDEX 1.
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'Long NIT should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD given_nit_spaces_then_warning.
+    " GIVEN: NIT with spaces
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_nit = ' 12345678 - 9 '
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: Warning with normalized value
+    cl_abap_unit_assert=>assert_equals(
+      act = lines( mt_messages )
+      exp = 1
+      msg = 'NIT with spaces should produce 1 message'
+    ).
+
+    READ TABLE mt_messages INTO DATA(ls_msg) INDEX 1.
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'W'
+      msg = 'NIT space normalization should be warning'
+    ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-proposed_value
+      exp = '12345678-9'
+      msg = 'Proposed value should remove spaces'
+    ).
+  ENDMETHOD.
+
+  METHOD nit_special_chars.
+    " GIVEN: NIT with special characters
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_nit = '12345678.9'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: Warning or error
+    cl_abap_unit_assert=>assert_not_initial(
+      act = mt_messages
+      msg = 'NIT with special chars should produce messages'
+    ).
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* Test Class: LTCL_TEST_DPI
+*----------------------------------------------------------------------*
+CLASS ltcl_test_dpi DEFINITION FOR TESTING
+  DURATION SHORT
+  RISK LEVEL HARMLESS.
+
+  PRIVATE SECTION.
+    DATA mo_validator TYPE REF TO zcop_bp_validator_pers.
+    DATA mt_messages  TYPE ty_t_validation_msg.
+
+    METHODS setup.
+
+    " GIVEN valid DPI formats
+    METHODS valid_dpi_13digits FOR TESTING.
+
+    " GIVEN invalid DPI formats
+    METHODS given_empty_dpi_then_error FOR TESTING.
+    METHODS given_dpi_12digits_then_error FOR TESTING.
+    METHODS given_dpi_14digits_then_error FOR TESTING.
+    METHODS dpi_with_letters FOR TESTING.
+
+    " GIVEN DPI needing normalization
+    METHODS dpi_with_spaces FOR TESTING.
+    METHODS dpi_with_dashes FOR TESTING.
+    METHODS dpi_mixed_format FOR TESTING.
+ENDCLASS.
+
+CLASS ltcl_test_dpi IMPLEMENTATION.
+  METHOD setup.
+    mo_validator = NEW zcop_bp_validator_pers( ).
+    CLEAR mt_messages.
+  ENDMETHOD.
+
+  METHOD valid_dpi_13digits.
+    " GIVEN: Valid DPI with exactly 13 digits
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_bp_type = '1'
+      iv_dpi_cui = '1234567890123'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: No messages
+    cl_abap_unit_assert=>assert_initial(
+      act = mt_messages
+      msg = 'Valid 13-digit DPI should produce no messages'
+    ).
+  ENDMETHOD.
+
+  METHOD given_empty_dpi_then_error.
+    " GIVEN: Empty DPI
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_bp_type = '1'
+      iv_dpi_cui = ''
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: Error
+    cl_abap_unit_assert=>assert_equals(
+      act = lines( mt_messages )
+      exp = 1
+      msg = 'Empty DPI should produce 1 message'
+    ).
+
+    READ TABLE mt_messages INTO DATA(ls_msg) INDEX 1.
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'Empty DPI should be error'
+    ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-field_name
+      exp = 'DPI_CUI'
+      msg = 'Field name should be DPI_CUI'
+    ).
+  ENDMETHOD.
+
+  METHOD given_dpi_12digits_then_error.
+    " GIVEN: DPI with 12 digits (too short)
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_bp_type = '1'
+      iv_dpi_cui = '123456789012'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: Error
+    cl_abap_unit_assert=>assert_equals(
+      act = lines( mt_messages )
+      exp = 1
+      msg = 'DPI with 12 digits should produce 1 message'
+    ).
+
+    READ TABLE mt_messages INTO DATA(ls_msg) INDEX 1.
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'Short DPI should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD given_dpi_14digits_then_error.
+    " GIVEN: DPI with 14 digits (too long)
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_bp_type = '1'
+      iv_dpi_cui = '12345678901234'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: Error
+    cl_abap_unit_assert=>assert_equals(
+      act = lines( mt_messages )
+      exp = 1
+      msg = 'DPI with 14 digits should produce 1 message'
+    ).
+
+    READ TABLE mt_messages INTO DATA(ls_msg) INDEX 1.
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'Long DPI should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD dpi_with_letters.
+    " GIVEN: DPI with letters
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_bp_type = '1'
+      iv_dpi_cui = '123456ABC0123'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: Error (after normalization removes letters, length is wrong)
+    cl_abap_unit_assert=>assert_not_initial(
+      act = mt_messages
+      msg = 'DPI with letters should produce messages'
+    ).
+
+    READ TABLE mt_messages INTO DATA(ls_msg) INDEX 1.
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'DPI with letters should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD dpi_with_spaces.
+    " GIVEN: DPI with spaces (valid after normalization)
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_bp_type = '1'
+      iv_dpi_cui = '1234 5678 90123'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: Warning with normalized value
+    cl_abap_unit_assert=>assert_equals(
+      act = lines( mt_messages )
+      exp = 1
+      msg = 'DPI with spaces should produce 1 message'
+    ).
+
+    READ TABLE mt_messages INTO DATA(ls_msg) INDEX 1.
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'W'
+      msg = 'DPI normalization should be warning'
+    ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-proposed_value
+      exp = '1234567890123'
+      msg = 'Proposed value should be normalized'
+    ).
+  ENDMETHOD.
+
+  METHOD dpi_with_dashes.
+    " GIVEN: DPI with dashes (valid after normalization)
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_bp_type = '1'
+      iv_dpi_cui = '1234-5678-90123'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: Warning with normalized value
+    cl_abap_unit_assert=>assert_equals(
+      act = lines( mt_messages )
+      exp = 1
+      msg = 'DPI with dashes should produce 1 message'
+    ).
+
+    READ TABLE mt_messages INTO DATA(ls_msg) INDEX 1.
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'W'
+      msg = 'DPI dash normalization should be warning'
+    ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-proposed_value
+      exp = '1234567890123'
+      msg = 'Proposed value should remove dashes'
+    ).
+  ENDMETHOD.
+
+  METHOD dpi_mixed_format.
+    " GIVEN: DPI with mixed formatting
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_bp_type = '1'
+      iv_dpi_cui = ' 1234-5678 90123 '
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->zif_bp_validator~validate( ls_bp ).
+
+    " THEN: Warning with normalized value
+    cl_abap_unit_assert=>assert_equals(
+      act = lines( mt_messages )
+      exp = 1
+      msg = 'DPI with mixed format should produce 1 message'
+    ).
+
+    READ TABLE mt_messages INTO DATA(ls_msg) INDEX 1.
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'W'
+      msg = 'Mixed format normalization should be warning'
+    ).
+  ENDMETHOD.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* Test Class: LTCL_TEST_CONTACT
+*----------------------------------------------------------------------*
+CLASS ltcl_test_contact DEFINITION FOR TESTING
+  DURATION SHORT
+  RISK LEVEL HARMLESS.
+
+  PRIVATE SECTION.
+    DATA mo_validator TYPE REF TO zcop_bp_validator_contact.
+    DATA mt_messages  TYPE ty_t_validation_msg.
+
+    METHODS setup.
+
+    " EMAIL Tests
+    METHODS given_valid_email_then_ok FOR TESTING.
+    METHODS given_empty_email_then_error FOR TESTING.
+    METHODS given_email_no_at_then_error FOR TESTING.
+    METHODS email_no_domain FOR TESTING.
+    METHODS email_dot_at_start FOR TESTING.
+    METHODS email_dot_at_end FOR TESTING.
+    METHODS email_uppercase FOR TESTING.
+    METHODS given_email_spaces_then_warn FOR TESTING.
+
+    " PHONE Tests
+    METHODS given_valid_phone_502_then_ok FOR TESTING.
+    METHODS given_empty_phone_then_error FOR TESTING.
+    METHODS given_phone_8digits_then_warn FOR TESTING.
+    METHODS given_phone_no_plus_then_warn FOR TESTING.
+    METHODS phone_wrong_code FOR TESTING.
+    METHODS given_phone_7digits_then_error FOR TESTING.
+    METHODS given_phone_9digits_then_error FOR TESTING.
+    METHODS given_phone_letters_then_error FOR TESTING.
+
+    " Combined tests
+    METHODS both_invalid_then_2errors FOR TESTING.
+
+    METHODS get_message_by_field
+      IMPORTING iv_field_name     TYPE string
+      RETURNING VALUE(rs_message) TYPE ty_validation_msg.
+ENDCLASS.
+
+CLASS ltcl_test_contact IMPLEMENTATION.
+  METHOD setup.
+    mo_validator = NEW zcop_bp_validator_contact( ).
+    CLEAR mt_messages.
+  ENDMETHOD.
+
+  METHOD get_message_by_field.
+    LOOP AT mt_messages INTO rs_message WHERE field_name = iv_field_name.
+      RETURN.
+    ENDLOOP.
+    CLEAR rs_message.
+  ENDMETHOD.
+
+  " ========== EMAIL TESTS ==========
+
+  METHOD given_valid_email_then_ok.
+    " GIVEN: Valid email
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = 'test@example.com'
+      iv_phone = '+50212345678'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: No email errors
+    DATA(ls_msg) = get_message_by_field( 'EMAIL' ).
+    cl_abap_unit_assert=>assert_initial(
+      act = ls_msg
+      msg = 'Valid email should produce no email messages'
+    ).
+  ENDMETHOD.
+
+  METHOD given_empty_email_then_error.
+    " GIVEN: Empty email
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = ''
+      iv_phone = '+50212345678'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: Error for email
+    DATA(ls_msg) = get_message_by_field( 'EMAIL' ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'Empty email should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD given_email_no_at_then_error.
+    " GIVEN: Email without @
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = 'testexample.com'
+      iv_phone = '+50212345678'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: Error
+    DATA(ls_msg) = get_message_by_field( 'EMAIL' ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'Email without @ should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD email_no_domain.
+    " GIVEN: Email without dot in domain
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = 'test@examplecom'
+      iv_phone = '+50212345678'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: Error
+    DATA(ls_msg) = get_message_by_field( 'EMAIL' ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'Email without domain dot should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD email_dot_at_start.
+    " GIVEN: Email with dot at start of domain
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = 'test@.example.com'
+      iv_phone = '+50212345678'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: Error
+    DATA(ls_msg) = get_message_by_field( 'EMAIL' ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'Email with dot at domain start should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD email_dot_at_end.
+    " GIVEN: Email with dot at end of domain
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = 'test@example.com.'
+      iv_phone = '+50212345678'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: Error
+    DATA(ls_msg) = get_message_by_field( 'EMAIL' ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'Email with dot at domain end should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD email_uppercase.
+    " GIVEN: Email with uppercase (needs normalization)
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = 'Test@Example.COM'
+      iv_phone = '+50212345678'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: Warning with lowercase proposed
+    DATA(ls_msg) = get_message_by_field( 'EMAIL' ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'W'
+      msg = 'Email uppercase should be warning'
+    ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-proposed_value
+      exp = 'test@example.com'
+      msg = 'Proposed should be lowercase'
+    ).
+  ENDMETHOD.
+
+  METHOD given_email_spaces_then_warn.
+    " GIVEN: Email with spaces (needs normalization)
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = ' test@example.com '
+      iv_phone = '+50212345678'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: Warning with trimmed proposed
+    DATA(ls_msg) = get_message_by_field( 'EMAIL' ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'W'
+      msg = 'Email with spaces should be warning'
+    ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-proposed_value
+      exp = 'test@example.com'
+      msg = 'Proposed should be trimmed'
+    ).
+  ENDMETHOD.
+
+  " ========== PHONE TESTS ==========
+
+  METHOD given_valid_phone_502_then_ok.
+    " GIVEN: Valid phone with +502
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = 'test@example.com'
+      iv_phone = '+50212345678'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: No phone errors
+    DATA(ls_msg) = get_message_by_field( 'PHONE' ).
+    cl_abap_unit_assert=>assert_initial(
+      act = ls_msg
+      msg = 'Valid phone should produce no phone messages'
+    ).
+  ENDMETHOD.
+
+  METHOD given_empty_phone_then_error.
+    " GIVEN: Empty phone
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = 'test@example.com'
+      iv_phone = ''
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: Error
+    DATA(ls_msg) = get_message_by_field( 'PHONE' ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'Empty phone should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD given_phone_8digits_then_warn.
+    " GIVEN: Phone with 8 digits only (needs +502 prefix)
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = 'test@example.com'
+      iv_phone = '12345678'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: Warning with +502 prefix added
+    DATA(ls_msg) = get_message_by_field( 'PHONE' ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'W'
+      msg = '8-digit phone should be warning'
+    ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-proposed_value
+      exp = '+50212345678'
+      msg = 'Proposed should add +502'
+    ).
+  ENDMETHOD.
+
+  METHOD given_phone_no_plus_then_warn.
+    " GIVEN: Phone with 502 but no + sign
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = 'test@example.com'
+      iv_phone = '50212345678'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: Warning with + added
+    DATA(ls_msg) = get_message_by_field( 'PHONE' ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'W'
+      msg = 'Phone without + should be warning'
+    ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-proposed_value
+      exp = '+50212345678'
+      msg = 'Proposed should add +'
+    ).
+  ENDMETHOD.
+
+  METHOD phone_wrong_code.
+    " GIVEN: Phone with wrong country code
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = 'test@example.com'
+      iv_phone = '+50312345678'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: Error
+    DATA(ls_msg) = get_message_by_field( 'PHONE' ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'Phone with wrong country code should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD given_phone_7digits_then_error.
+    " GIVEN: Phone with 7 digits (too short)
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = 'test@example.com'
+      iv_phone = '1234567'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: Error
+    DATA(ls_msg) = get_message_by_field( 'PHONE' ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = '7-digit phone should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD given_phone_9digits_then_error.
+    " GIVEN: Phone with 9 digits (too long without code)
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = 'test@example.com'
+      iv_phone = '123456789'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: Error
+    DATA(ls_msg) = get_message_by_field( 'PHONE' ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = '9-digit phone should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD given_phone_letters_then_error.
+    " GIVEN: Phone with letters
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = 'test@example.com'
+      iv_phone = '+502ABC45678'
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: Error (after removing letters, length is wrong)
+    DATA(ls_msg) = get_message_by_field( 'PHONE' ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_msg-severity
+      exp = 'E'
+      msg = 'Phone with letters should be error'
+    ).
+  ENDMETHOD.
+
+  METHOD both_invalid_then_2errors.
+    " GIVEN: Both email and phone invalid
+    DATA(ls_bp) = ltcl_test_helper=>create_bp_context(
+      iv_email = ''
+      iv_phone = ''
+    ).
+
+    " WHEN: Validate
+    mt_messages = mo_validator->validate_contact( ls_bp ).
+
+    " THEN: 2 error messages
+    cl_abap_unit_assert=>assert_equals(
+      act = lines( mt_messages )
+      exp = 2
+      msg = 'Both invalid should produce 2 messages'
+    ).
+
+    DATA(ls_email_msg) = get_message_by_field( 'EMAIL' ).
+    DATA(ls_phone_msg) = get_message_by_field( 'PHONE' ).
+
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_email_msg-severity
+      exp = 'E'
+      msg = 'Email should be error'
+    ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_phone_msg-severity
+      exp = 'E'
+      msg = 'Phone should be error'
+    ).
+  ENDMETHOD.
+ENDCLASS.
+
+
+*----------------------------------------------------------------------*
+* Main Entry Point
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+  DATA(lo_controller) = NEW lcl_main_controller( ).
+  lo_controller->run( ).
